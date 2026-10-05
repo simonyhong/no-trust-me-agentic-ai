@@ -877,6 +877,15 @@ def _read_done_ids(done_file: pathlib.Path) -> set[str]:
         return set()
 
 
+def _read_rejected_hashes(done_file: pathlib.Path) -> set[str]:
+    try:
+        data = json.loads(done_file.read_text(encoding="utf-8"))
+        rejected = data.get("rejected", {})
+        return set(rejected) if isinstance(rejected, dict) else set()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
 def _runtime_record_hash(record: Any) -> str:
     payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
@@ -1842,15 +1851,22 @@ def process_single_brd_standalone(
                             if not id_field:
                                 raise ValueError("schema has no incident_id field; cannot track processed jobs")
                             done_ids = _read_done_ids(done_file)
-                            new_jobs = [rec for rec in jobs if str(rec.get(id_field)) not in done_ids]
+                            rejected_hashes = _read_rejected_hashes(done_file)
+                            new_jobs = []
+                            for rec in jobs:
+                                if _runtime_record_hash(rec) in rejected_hashes:
+                                    continue
+                                if isinstance(rec, dict) and id_field in rec and str(rec[id_field]) in done_ids:
+                                    continue
+                                new_jobs.append(rec)
                             has_new_jobs = bool(new_jobs)
 
                             if not has_new_jobs and last_jobs_state != "idle":
-                                module_logger.info("No new jobs for %s — all done.", brd_path.name)
+                                module_logger.info("No actionable jobs for %s — all processed or rejected.", brd_path.name)
                                 last_jobs_state = "idle"
                             elif has_new_jobs and last_jobs_state != "pending":
-                                module_logger.info("%d new job(s) for %s (done %d/%d).",
-                                                   len(new_jobs), brd_path.name, total_jobs - len(new_jobs), total_jobs)
+                                module_logger.info("%d actionable job(s) for %s.",
+                                                   len(new_jobs), brd_path.name)
                                 if is_debug_mode:
                                     module_logger.debug("First job preview: %s", json.dumps(new_jobs[0], ensure_ascii=False)[:800])
                                 last_jobs_state = "pending"
