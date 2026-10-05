@@ -11,7 +11,7 @@ import random
 import multiprocessing
 import queue
 import openai
-from openai import APIStatusError, RateLimitError
+from openai import APIConnectionError, APIStatusError, RateLimitError
 from typing import Callable, Any, List, Set, Tuple, Dict, Optional
 import traceback
 import tempfile
@@ -21,6 +21,7 @@ import logging, sys
 _RETRY_STEPS = 6
 MAX_ATTEMPTS = 10
 MAX_BATCH_FAILURES = 3
+_PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -195,8 +196,9 @@ types, or output structure. Your job is only to implement the function.
 
 Return executable Python source code ONLY.
 Do not add prose before or after the code.
-Do not use os, sys, subprocesses, sockets, raw network clients, eval/exec/compile,
-direct file-opening builtins, dynamic attribute introspection, or private/dunder attributes.
+Only import from these modules: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS - {'my_tools'}))}.
+Do not use eval/exec/compile, file access, getattr/introspection, frame objects,
+or private/dunder attributes. Use f-strings, not str.format().
 If the BRD requires an LLM call, use my_tools.ask_gpt(messages, temperature=...);
 never access an authenticated model client directly.
 """
@@ -232,17 +234,27 @@ def clean_generated_code(resp_text: str) -> str:
     return code
 
 
-_FORBIDDEN_IMPORT_ROOTS = {
-    "os", "sys", "subprocess", "socket", "requests", "httpx", "urllib", "ftplib",
-    "shutil", "pathlib", "importlib", "builtins", "ctypes", "pickle", "marshal",
-    "inspect", "resource", "signal", "openai", "brd_processor", "source", "job_manager",
+# Allowlist: generated code may import only these modules. This is a static
+# defense-in-depth screen, not a sandbox.
+_ALLOWED_IMPORT_ROOTS = {
+    "re", "math", "string", "json", "collections", "itertools", "functools",
+    "datetime", "decimal", "fractions", "statistics", "unicodedata", "typing",
+    "heapq", "bisect", "copy", "enum", "textwrap", "difflib", "random",
+    "my_tools",
 }
 _FORBIDDEN_NAMES = {
     "exec", "eval", "compile", "open", "__import__", "globals", "locals", "vars",
     "getattr", "setattr", "delattr", "breakpoint", "input", "help", "exit", "quit",
     "__builtins__",
 }
-_FORBIDDEN_TOOL_ATTRS = {"gpt_client", "shared_data", "gpt_semaphore"}
+_FORBIDDEN_ATTRS = {
+    "gpt_client", "shared_data", "gpt_semaphore",
+    "format", "format_map", "vformat", "Formatter",
+    "get_type_hints", "ForwardRef",
+    "gi_frame", "gi_code", "cr_frame", "cr_code", "ag_frame", "ag_code",
+    "f_globals", "f_locals", "f_builtins", "f_back", "f_code",
+    "tb_frame", "tb_next", "co_code", "co_consts",
+}
 
 
 def _static_safety_check(code: str) -> None:
@@ -259,28 +271,27 @@ def _static_safety_check(code: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in _FORBIDDEN_IMPORT_ROOTS:
+                if alias.name.split(".")[0] not in _ALLOWED_IMPORT_ROOTS:
                     raise ValueError(f"line {node.lineno}: import of {alias.name!r} is not allowed")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if node.level or root in _FORBIDDEN_IMPORT_ROOTS:
+            if node.level or root not in _ALLOWED_IMPORT_ROOTS:
                 raise ValueError(f"line {node.lineno}: import from {node.module!r} is not allowed")
-            if node.module == "my_tools":
-                for alias in node.names:
-                    if alias.name == "*" or alias.name in _FORBIDDEN_TOOL_ATTRS:
-                        raise ValueError(f"line {node.lineno}: importing {alias.name!r} from my_tools is not allowed")
+            for alias in node.names:
+                if alias.name == "*" or alias.name in _FORBIDDEN_ATTRS or alias.name in _FORBIDDEN_NAMES:
+                    raise ValueError(f"line {node.lineno}: importing {alias.name!r} is not allowed")
         elif isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
             raise ValueError(f"line {node.lineno}: use of {node.id!r} is not allowed")
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("_"):
                 raise ValueError(f"line {node.lineno}: private/dunder attribute {node.attr!r} is not allowed")
-            if node.attr in _FORBIDDEN_TOOL_ATTRS:
-                raise ValueError(f"line {node.lineno}: attribute {node.attr!r} is not available to generated code")
+            if node.attr in _FORBIDDEN_ATTRS:
+                raise ValueError(f"line {node.lineno}: attribute {node.attr!r} is not allowed in generated code")
+
 
 
 def _extract_section_body(brd_text: str, heading: str) -> str:
-    """Return a rigid BRD section body by matching a true heading line."""
+    """Return a rigid BRD section body by matching a true underlined heading."""
     lines = brd_text.splitlines()
     wanted = heading.strip().upper()
 
@@ -291,21 +302,22 @@ def _extract_section_body(brd_text: str, heading: str) -> str:
             text = match.group(1).strip()
         return text.rstrip(":").strip().upper()
 
-    def _is_numbered_section_heading(index: int) -> bool:
-        if not re.fullmatch(r"\d+\.\s+\S.*", lines[index].strip()):
-            return False
+    def _has_heading_underline(index: int) -> bool:
         next_index = index + 1
         while next_index < len(lines) and not lines[next_index].strip():
             next_index += 1
         return next_index < len(lines) and bool(re.fullmatch(r"[-=]{3,}", lines[next_index].strip()))
 
+    def _is_numbered_section_heading(index: int) -> bool:
+        return bool(re.fullmatch(r"\d+\.\s+\S.*", lines[index].strip())) and _has_heading_underline(index)
+
     start = None
     for i, line in enumerate(lines):
-        if _normalized_heading(line) == wanted:
+        if _normalized_heading(line) == wanted and _has_heading_underline(i):
             start = i + 1
             break
     if start is None:
-        raise ValueError(f"BRD is missing required section: {heading}")
+        raise ValueError(f"BRD is missing required underlined section: {heading}")
 
     end = len(lines)
     for i in range(start, len(lines)):
@@ -606,7 +618,7 @@ def prepare_deployment_validation_jobs(
     identified from JOBS DATA STRUCTURE. Unlabeled records do not count toward N.
     """
     jobs = _load_jobs_list(jobs_path)
-    exp_field = jobs_schema.get("expected")
+    exp_field = jobs_schema["expected"]
     id_field = jobs_schema.get("incident_id")
     param_names = list(jobs_schema.get("inputs") or [])
 
@@ -668,7 +680,7 @@ def run_deployment_validation_jobs(
     """Require the candidate function to pass the preselected labeled jobs exactly."""
     param_names = list(jobs_schema.get("inputs") or [])
     id_field = jobs_schema.get("incident_id")
-    exp_field = jobs_schema.get("expected")
+    exp_field = jobs_schema["expected"]
 
     for ordinal, rec in enumerate(deployment_jobs, start=1):
         incident_id = str(rec.get(id_field, "?")) if id_field else "?"
@@ -823,7 +835,11 @@ def brd_hash_signature(txt: str, length: int = 8) -> str:
     return hashlib.blake2s(txt.encode(), digest_size=16).hexdigest()[:length]
 
 
+_temperature_unsupported = False
+
+
 def gpt_call_with_retry(semaphore, **kwargs):
+    global _temperature_unsupported
     if gpt_client is None or not my_tools.gpt_model:
         raise RuntimeError(
             "Azure OpenAI is not configured. Set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, "
@@ -831,6 +847,9 @@ def gpt_call_with_retry(semaphore, **kwargs):
         )
 
     call_kwargs = dict(kwargs)
+    if _temperature_unsupported:
+        call_kwargs.pop("temperature", None)
+
     backoff = 1.0
     for _ in range(_RETRY_STEPS):
         try:
@@ -841,17 +860,22 @@ def gpt_call_with_retry(semaphore, **kwargs):
             message = str(exc).lower()
             if status == 400 and "temperature" in call_kwargs and "temperature" in message:
                 call_kwargs.pop("temperature", None)
-                LOG.warning("Deployment rejected temperature; retrying without it.")
+                _temperature_unsupported = True
+                LOG.warning("Deployment rejected temperature; retrying without it (remembered for this worker).")
                 continue
             if status != 429:
                 LOG.exception("GPT hard error")
                 raise
+            LOG.warning("GPT 429 - backing off")
+        except APIConnectionError as exc:
+            LOG.warning("GPT connection error (%s) - backing off", type(exc).__name__)
 
         sleep = backoff + random.uniform(0, 0.3)
-        LOG.warning("GPT 429 - retry in %.1fs", sleep)
-        time.sleep(sleep)  # semaphore is intentionally released during backoff
+        LOG.warning("GPT retry in %.1fs", sleep)
+        time.sleep(sleep)
         backoff = min(backoff * 2, 60)
     raise RuntimeError("GPT call failed after retries")
+
 
 
 def _generated_ask_gpt(messages, temperature=0):
@@ -921,7 +945,7 @@ def process_jobs(
 
     param_names: List[str] = list(jobs_schema.get("inputs") or [])
     id_field: Optional[str] = jobs_schema.get("incident_id")
-    exp_field: Optional[str] = jobs_schema.get("expected")
+    exp_field: Optional[str] = jobs_schema["expected"]
     if not id_field:
         raise ValueError("Runtime jobs require a Python-parsed ID_FIELD")
 
@@ -946,17 +970,23 @@ def process_jobs(
     except Exception:
         results = {}
 
+    def _persist_results() -> bool:
+        try:
+            _atomic_write_json(results_file, {"results": results})
+            return True
+        except Exception as exc:
+            LOG.warning("Could not write results file %s: %s", results_file, exc)
+            return False
+
     def _persist_done() -> None:
+        # Results are persisted first so done-state never claims a successful job
+        # whose output is absent from the local results file.
+        if not _persist_results():
+            return
         try:
             _atomic_write_json(done_file, {"ids": sorted(done_ids), "rejected": rejected})
         except Exception as exc:
             LOG.warning("Could not write done file %s: %s", done_file, exc)
-
-    def _persist_results() -> None:
-        try:
-            _atomic_write_json(results_file, {"results": results})
-        except Exception as exc:
-            LOG.warning("Could not write results file %s: %s", results_file, exc)
 
     new_jobs = []
     for rec in jobs:
@@ -972,6 +1002,7 @@ def process_jobs(
         return True, None
 
     LOG.info("Batch start for %s: %d actionable / %d total", jobs_path.name, len(new_jobs), len(jobs))
+    unsaved = 0
 
     for rec in new_jobs:
         record_hash = _runtime_record_hash(rec)
@@ -1031,7 +1062,6 @@ def process_jobs(
                     )
                     LOG.warning("incident_id=%s: output contract violation: %s", incident_id, reason)
                     _persist_done()
-                    _persist_results()
                     return False, reflection
 
             if compare_expected and exp_field and exp_field in rec:
@@ -1048,19 +1078,20 @@ def process_jobs(
                         incident_id, result, type(result).__name__, expected, type(expected).__name__,
                     )
                     _persist_done()
-                    _persist_results()
                     return False, reflection
 
             LOG.info("incident_id=%s: %s", incident_id, result)
             results[incident_id] = result
-            _persist_results()  # persist output before marking the job done
             done_ids.add(incident_id)
             # If a corrected record for this incident succeeds, clear older rejection entries for that ID.
             rejected = {
                 key: value for key, value in rejected.items()
                 if not isinstance(value, dict) or value.get("incident_id") != incident_id
             }
-            _persist_done()
+            unsaved += 1
+            if unsaved >= _PERSIST_EVERY:
+                _persist_done()
+                unsaved = 0
 
         except Exception as exc:
             try:
@@ -1078,9 +1109,9 @@ def process_jobs(
             )
             LOG.error("incident_id=%s crashed: %s", incident_id, exc, exc_info=True)
             _persist_done()
-            _persist_results()
             return False, reflection
 
+    _persist_done()
     return True, None
 
 
@@ -1137,11 +1168,9 @@ def _get_or_create_function(
 
     jobs_schema = {
         "inputs": param_names,
-        "incident_id": schema.get("incident_id") or schema.get("id") or schema.get("job_id"),
-        "expected": schema.get("expected"),
+        "incident_id": schema["incident_id"],
+        "expected": schema["expected"],
     }
-    jobs_path = brd_path.with_name(f"{brd_path.stem}_jobs.json")
-    done_file = jobs_path.with_name(f"done_{jobs_path.stem}.json")
 
     # [1] Handcrafted implementation.
     handcrafted = saved_func_dir / f"{brd_path.stem}_handcrafted"
@@ -1272,8 +1301,9 @@ def _get_or_create_function(
         except Exception as exc:
             local_reflection = (
                 f"Your code was rejected by the static safety screen: {exc}. "
-                "Do not use OS/process/network client modules, direct file-opening builtins, "
-                "eval/exec/introspection, or private/dunder attributes."
+                f"Only import from: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS - {'my_tools'}))}. "
+                "No eval/exec, file access, getattr/introspection, frame objects, str.format(), "
+                "or private/dunder attributes."
             )
             logger.warning("Attempt %d failed static safety screen: %s", attempt, exc)
             continue
@@ -1766,8 +1796,8 @@ def process_single_brd_standalone(
                 if cached_func is None:
                     jobs_schema_for_deploy = {
                         "inputs": [item["name"] for item in contract["input"]],
-                        "expected": schema.get("expected"),
-                        "incident_id": schema.get("incident_id") or schema.get("id") or schema.get("job_id"),
+                        "expected": schema["expected"],
+                        "incident_id": schema["incident_id"],
                     }
                     jobs_path_for_deploy = brd_path.with_name(f"{brd_path.stem}_jobs.json")
 
@@ -1830,8 +1860,8 @@ def process_single_brd_standalone(
                 # ----------------- Jobs derivation -----------------
                 jobs_schema = {
                     "inputs": [item["name"] for item in contract["input"]],
-                    "expected": schema.get("expected"),
-                    "incident_id": schema.get("incident_id") or schema.get("id") or schema.get("job_id"),
+                    "expected": schema["expected"],
+                    "incident_id": schema["incident_id"],
                 }
 
                 jobs_path = brd_path.with_name(f"{brd_path.stem}_jobs.json")

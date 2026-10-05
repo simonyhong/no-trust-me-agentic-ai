@@ -8,7 +8,7 @@ The core idea is simple: do not trust the LLM's self-evaluation. The generated f
 2. the BRD-authored examples and expected outputs,
 3. the first `N_ITEMS_TO_PASS` labeled jobs from the matching jobs file.
 
-After a function is deployed, normal jobs are processed by the Python function directly. The LLM is used during BRD initialization/change, function generation, and failure recovery, not for every ordinary job.
+After a function is deployed, normal jobs are processed by the Python function directly. The framework itself uses the LLM during BRD initialization/change, function generation, and failure recovery. A generated implementation may optionally call `my_tools.ask_gpt(...)` during ordinary jobs when its BRD truly requires LLM reasoning; in that case those jobs do invoke the LLM and their outputs may be nondeterministic.
 
 ## Repository layout
 
@@ -142,7 +142,9 @@ saved_functions/registry.json
 saved_functions/BRD_word_count/
 ```
 
-The results file persists each successfully processed job output. Progress is written incrementally, so jobs completed before a later batch failure are not lost. These runtime-generated files are intentionally ignored by Git.
+The results file persists successfully processed job outputs. Runtime state is flushed in bounded batches, with results written before done-state, so a crash can cause a small amount of safe re-processing but should not mark a successful job done before its output has been persisted.
+
+Malformed runtime records are recorded under `rejected` in the matching `done_*.json` file using a hash of the record contents. If that record is corrected later, its hash changes and the corrected job becomes eligible again. These runtime-generated files are intentionally ignored by Git.
 
 ## Resetting done-state during debugging
 
@@ -156,13 +158,13 @@ RESET_DONE_STATE=1 python job_manager.py
 
 ## Security notice
 
-Generated Python code is statically screened before execution, and generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client. However, generated Python still executes inside the worker process:
+Generated Python code is statically screened before execution with an import allowlist plus restrictions on dangerous builtins, frame/code-object traversal, private/dunder attributes, and string-format attribute traversal. Generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client. However, generated Python still executes inside the worker process:
 
 ```python
 exec(code, ns)
 ```
 
-The static screen is defense-in-depth, not a sandbox. Run this project only in a controlled environment. Do not expose the generation path to untrusted BRDs, untrusted model output, production credentials, or sensitive data until process isolation, timeouts, and stronger sandboxing are added.
+The static screen is defense-in-depth, not a sandbox or security boundary. Run this project only in a controlled environment. Do not expose the generation path to untrusted BRDs, untrusted model output, production credentials, or sensitive data until generated implementations are isolated in a separate process with execution timeouts and stronger filesystem/network controls.
 
 ## Public-data caution
 
