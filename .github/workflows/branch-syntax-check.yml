@@ -14,3 +14,13 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install -r requirements.txt
       - run: python -m py_compile job_manager.py source/brd_processor.py
+      - name: Verify deterministic naming without Azure configuration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from source.brd_processor import brd_to_function_name, gpt_client
+          assert brd_to_function_name(Path("BRD_word_count.txt")) == "word_count"
+          assert brd_to_function_name(Path("BRD_email_router.txt")) == "email_router"
+          assert gpt_client is None
+          print("deterministic naming and no-Azure import: PASS")
+          PY
