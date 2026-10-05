@@ -17,6 +17,7 @@ all_process_fallback.log
 
 # Runtime processing state
 documents/done_BRD_*_jobs.json
+documents/results_BRD_*_jobs.json
 
 # Generated implementation state
 saved_functions/registry.json
