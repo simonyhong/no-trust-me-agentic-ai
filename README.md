@@ -21,6 +21,8 @@ no-trust-me-agentic-ai/
 ├── documents/
 │   ├── BRD_word_count.txt                 # Sanitized demonstration BRD
 │   └── BRD_word_count_jobs.json           # Labeled demonstration jobs
+├── docs/
+│   └── No_Trust_Me_Agentic_AI.pptx        # Project overview presentation
 ├── saved_functions/
 │   └── .gitkeep                           # Runtime generated files go here
 ├── .env.example
