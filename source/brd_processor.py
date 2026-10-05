@@ -1078,7 +1078,6 @@ def process_jobs(
                         incident_id, result, type(result).__name__, expected, type(expected).__name__,
                     )
                     _persist_done()
-                    _persist_results()
                     return False, reflection
 
             LOG.info("incident_id=%s: %s", incident_id, result)
