@@ -235,7 +235,7 @@ def clean_generated_code(resp_text: str) -> str:
 _FORBIDDEN_IMPORT_ROOTS = {
     "os", "sys", "subprocess", "socket", "requests", "httpx", "urllib", "ftplib",
     "shutil", "pathlib", "importlib", "builtins", "ctypes", "pickle", "marshal",
-    "inspect", "resource", "signal", "openai",
+    "inspect", "resource", "signal", "openai", "brd_processor", "source", "job_manager",
 }
 _FORBIDDEN_NAMES = {
     "exec", "eval", "compile", "open", "__import__", "globals", "locals", "vars",
