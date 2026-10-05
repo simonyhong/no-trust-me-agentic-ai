@@ -828,14 +828,17 @@ def main():
     docs_dir.mkdir(parents=True, exist_ok=True)
 
     if RESET_DONE_STATE:
-        deleted_done_files = 0
+        deleted_state_files = 0
         for jobs_json in docs_dir.glob("BRD_*_jobs.json"):
-            done_file = jobs_json.parent / f"done_{jobs_json.stem}.json"
-            if done_file.exists():
-                done_file.unlink()
-                deleted_done_files += 1
-                logging.info("Deleted debug done-file %s", done_file)
-        logging.info("Debug reset complete - removed %d done-state files.", deleted_done_files)
+            for state_file in (
+                jobs_json.parent / f"done_{jobs_json.stem}.json",
+                jobs_json.parent / f"results_{jobs_json.stem}.json",
+            ):
+                if state_file.exists():
+                    state_file.unlink()
+                    deleted_state_files += 1
+                    logging.info("Deleted debug state file %s", state_file)
+        logging.info("Debug reset complete - removed %d runtime state files.", deleted_state_files)
 
     # ── [4] launch the JobManager ───────────────────────────────────────
     # NOTE: set to_activate_console=False if you don’t want console logs
