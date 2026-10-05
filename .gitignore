@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+openai_key.py
+
+# Runtime logs
+*.log
+all_process.log
+all_process_fallback.log
+
+# Runtime processing state
+documents/done_BRD_*_jobs.json
+
+# Generated implementation state
+saved_functions/registry.json
+saved_functions/BRD_*/
+!saved_functions/.gitkeep
+
+# Keep optional human-written implementations if intentionally committed
+!saved_functions/BRD_*_handcrafted/
+!saved_functions/BRD_*_handcrafted/*.py
+
+# Protect real BRDs/job data in public commits.
+# Explicitly whitelist only the sanitized demonstration.
+documents/*
+!documents/BRD_word_count.txt
+!documents/BRD_word_count_jobs.json

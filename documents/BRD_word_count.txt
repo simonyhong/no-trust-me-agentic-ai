@@ -1,0 +1,101 @@
+Word-Counting Capability - Business Requirement Document
+========================================================
+
+1. PURPOSE
+----------
+The system must tell us how many words appear in any text fragment that a
+customer, analyst, or downstream process provides.
+
+2. BUSINESS VALUE
+-----------------
+• Enables accurate analytics on user-generated content
+• Feeds KPI dashboards that monitor engagement and text volume
+• Reduces manual counting errors when cleaning or auditing data
+
+3. SCOPE & RULES
+----------------
+• A "word" is any cluster of letters, digits, or apostrophes surrounded by
+  spaces or punctuation.
+• Hyphenated phrases are treated as separate words
+  (e.g. "well-known" counts as two).
+• Ignore extra spaces at the beginning or end of the text.
+• Multiple spaces in a row still separate words only once.
+• The solution must rely solely on standard, broadly-available technology
+  (no paid third-party libraries).
+
+4. FUNCTION INPUT/OUTPUT CONTRACT
+---------------------------------
+The following JSON object is authoritative for the Python inspector.
+Python must parse it directly; neither the generator LLM nor Python may
+reinterpret or invent fields, types, or output structure.
+
+{
+  "input": [
+    {
+      "name": "text",
+      "type": "string"
+    }
+  ],
+  "output": {
+    "type": "integer"
+  }
+}
+
+5. TEST EXAMPLES & EXPECTED RESULTS
+-----------------------------------
+The following JSON array is authoritative. Python must parse and execute these
+tests directly. The code-generating LLM must not invent tests or expected outputs.
+
+[
+  {
+    "input": "",
+    "output": 0
+  },
+  {
+    "input": "Hello world",
+    "output": 2
+  },
+  {
+    "input": "The quick brown fox",
+    "output": 4
+  },
+  {
+    "input": "  This  --  has   weird   spacing ",
+    "output": 4
+  },
+  {
+    "input": "Don't stop believing",
+    "output": 3
+  },
+  {
+    "input": "O'Reilly's book",
+    "output": 2
+  },
+  {
+    "input": "well-known",
+    "output": 2
+  },
+  {
+    "input": "hyphenated-word and another-one",
+    "output": 5
+  }
+]
+
+########################## TECHNICAL DESCRIPTIONS ##########################
+
+6. JOBS DATA STRUCTURE
+----------------------
+The structure of jobs.json looks like this:
+
+[
+  {
+    "incident_id": "A1",
+    "text": "Hello world",
+    "expected_word_count": 2
+  }
+]
+N_ITEMS_TO_PASS=15
+
+The data-part of the input for the function should be "text".
+The expected output field in each job record is "expected_word_count".
+The function should handle only one job.
