@@ -8,7 +8,7 @@ The core idea is simple: do not trust the LLM's self-evaluation. The generated f
 2. the BRD-authored examples and expected outputs,
 3. the first `N_ITEMS_TO_PASS` labeled jobs from the matching jobs file.
 
-After a function is deployed, normal jobs are processed by the Python function directly. The framework itself uses the LLM during BRD initialization/change, function generation, and failure recovery. A generated implementation may optionally call `my_tools.ask_gpt(...)` during ordinary jobs when its BRD truly requires LLM reasoning; in that case those jobs do invoke the LLM and their outputs may be nondeterministic.
+After a function is deployed, normal jobs are processed by the Python function directly. Python derives the implementation function name deterministically from the BRD filename (for example, `BRD_word_count.txt -> word_count()`), so no LLM call is needed merely to initialize or re-read a BRD. The framework uses the LLM only when a new/generated implementation is actually needed or during failure recovery. A generated implementation may optionally call `my_tools.ask_gpt(...)` during ordinary jobs when its BRD truly requires LLM reasoning; in that case those jobs do invoke the LLM and their outputs may be nondeterministic.
 
 ## Repository layout
 
@@ -86,6 +86,8 @@ Python parses these directives directly; the LLM does not choose the job ID fiel
 
 ## Candidate selection order
 
+The callable name for a new implementation is derived from the BRD filename by removing the `BRD_` prefix. For example, `BRD_email_router.txt` maps to `email_router()`. Existing handcrafted modules with a legacy/custom name remain usable when they contain exactly one public function.
+
 For each current BRD hash, the worker tries candidates in this order:
 
 1. optional handcrafted implementation from `saved_functions/<BRD stem>_handcrafted/`,
@@ -108,22 +110,24 @@ Create and activate a Python environment, then install dependencies:
 pip install -r requirements.txt
 ```
 
-Copy the environment template:
+Copy the environment template to a private local `.env` file:
 
 ```bash
 cp .env.example .env
 ```
 
-Set these variables in your shell or environment manager:
+Then edit `.env` and put your real Azure values there:
 
-```bash
-export AZURE_OPENAI_API_KEY="..."
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
-export AZURE_OPENAI_API_VERSION="2025-01-01-preview"
-export AZURE_OPENAI_DEPLOYMENT="your-deployment-name"
+```text
+AZURE_OPENAI_API_KEY=your-real-key
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AZURE_OPENAI_DEPLOYMENT=your-deployment-name
 ```
 
-This project does not load `.env` automatically; `.env.example` is only a template. Either export the variables in your shell or add your preferred environment-loading mechanism.
+The program automatically loads the repository-root `.env` file. Existing shell/environment variables take precedence over values in `.env`.
+
+**Never put a real key in `.env.example`.** That file is a public template. The real `.env` file is ignored by Git.
 
 ## Run the word-count demo
 
