@@ -94,6 +94,8 @@ The structure of jobs.json looks like this:
     "expected_word_count": 2
   }
 ]
+ID_FIELD=incident_id
+EXPECTED_FIELD=expected_word_count
 N_ITEMS_TO_PASS=15
 
 The data-part of the input for the function should be "text".

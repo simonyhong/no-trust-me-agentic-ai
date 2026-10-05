@@ -15,10 +15,12 @@ from openai import APIStatusError, RateLimitError
 from typing import Callable, Any, List, Set, Tuple, Dict, Optional
 import traceback
 import tempfile
+import ast
 import logging, sys
 
 _RETRY_STEPS = 6
 MAX_ATTEMPTS = 10
+MAX_BATCH_FAILURES = 3
 LOG = logging.getLogger("brd_processor")
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -34,17 +36,16 @@ if AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT:
         api_version=AZURE_OPENAI_API_VERSION,
     )
 
-############ Make a Synthetic Module to import  #####
-# This "Synthetic Module" is needed because some objects, like gpt_semaphore, (which is handed over by job_manager.py) are not initially global, so I register: "my_tools.gpt_semaphore = gpt_semaphore"
-# and I do not want GPT to include these objects as part of the arguements in the function that it makes.
+_active_gpt_semaphore = None
+
+# Synthetic module exposed to generated functions. Keep this surface deliberately small.
 import types
-toolbox = types.ModuleType("my_tools")   # synthetic; lives only in memory
-toolbox.log     = logging.getLogger("my_tools") 
-toolbox.gpt_client = gpt_client                    
-toolbox.gpt_model = AZURE_OPENAI_DEPLOYMENT 
-sys.modules["my_tools"] = toolbox    # register the module
-import my_tools                      # fetch the same module object
-######################################################
+toolbox = types.ModuleType("my_tools")
+toolbox.log = logging.getLogger("my_tools")
+toolbox.gpt_model = AZURE_OPENAI_DEPLOYMENT
+toolbox.ask_gpt = None
+sys.modules["my_tools"] = toolbox
+import my_tools
 
 def _atomic_write_json(target: pathlib.Path, data: dict) -> None:
     """
@@ -110,35 +111,20 @@ def load_script(*, namespace: str, py_path: pathlib.Path | None = None,
     return mod
 
 def gpt_extract_function_and_data_schema(brd_text: str, gpt_semaphore: multiprocessing.Semaphore) -> dict[str, Any]:
-    """Extract only function name and optional runtime-job metadata.
+    """Extract only the Python function name.
 
-    Function input names/types and the output contract are NOT inferred by the LLM;
-    Python reads those from the BRD's FUNCTION INPUT/OUTPUT CONTRACT JSON section.
+    Python, not the LLM, parses the function I/O contract, tests, ID_FIELD,
+    EXPECTED_FIELD, and N_ITEMS_TO_PASS from rigid BRD sections.
     """
     SYSTEM = (
         "You are a technical requirements analyst.\n"
         "Read the Business Requirement Document (BRD).\n"
-        "Python separately parses the BRD's FUNCTION INPUT/OUTPUT CONTRACT and TEST EXAMPLES sections.\n"
-        "Do NOT use generic test keys such as 'input' or 'output' as job-field names.\n"
-        "From the BRD, choose the Python function name and identify runtime-job metadata from the JOBS DATA STRUCTURE section.\n"
-        "Return exactly ONE line of valid JSON.\n\n"
-        "Required keys\n"
-        "-------------\n"
-        '  "function_name" : snake_case Python identifier (string)\n'
-        '  "incident_id"   : runtime job field used to uniquely identify a job record (string)\n\n'
-        "Required when labeled jobs are defined in JOBS DATA STRUCTURE\n"
-        "-----------------------------------------------------------\n"
-        '  "expected" : runtime/development job field containing the target/expected output\n\n'
-        "Important\n"
-        "---------\n"
-        "• N_ITEMS_TO_PASS is BRD deployment metadata, NOT a job-record field.\n"
-        "• If N_ITEMS_TO_PASS is present, identify the job-record field that contains the target answer and return it as 'expected'.\n\n"
-        "Formatting rules\n"
-        "---------------\n"
-        "• One line of strict JSON; no markdown, prose, or comments.\n"
-        "• Use only the keys above.\n"
+        "Python separately parses all trust-critical contracts, tests, and job metadata.\n"
+        "Choose only the Python function name that best represents the BRD task.\n"
+        "Return exactly ONE line of valid JSON with exactly one key:\n"
+        '  {"function_name":"snake_case_python_identifier"}\n'
+        "No markdown, prose, comments, or additional keys."
     )
-
     resp = gpt_call_with_retry(
         gpt_semaphore,
         messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": brd_text}],
@@ -148,12 +134,14 @@ def gpt_extract_function_and_data_schema(brd_text: str, gpt_semaphore: multiproc
     try:
         schema = json.loads(txt)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"GPT job-metadata JSON invalid: {exc}\n---\n{txt}") from exc
-    if not isinstance(schema, dict) or not schema.get("function_name"):
-        raise ValueError(f"GPT job-metadata JSON missing required function_name: {schema!r}")
-    if not schema.get("incident_id"):
-        raise ValueError(f"GPT job-metadata JSON missing required incident_id: {schema!r}")
+        raise ValueError(f"GPT function-name JSON invalid: {exc}\n---\n{txt}") from exc
+    if not isinstance(schema, dict) or set(schema) != {"function_name"}:
+        raise ValueError(f"GPT function-name JSON must contain only function_name: {schema!r}")
+    function_name = schema["function_name"]
+    if not isinstance(function_name, str) or not _ID_RE.fullmatch(function_name):
+        raise ValueError(f"GPT returned invalid Python function_name: {function_name!r}")
     return schema
+
 
 
 _ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")   # valid Python identifier
@@ -207,6 +195,10 @@ types, or output structure. Your job is only to implement the function.
 
 Return executable Python source code ONLY.
 Do not add prose before or after the code.
+Do not use os, sys, subprocesses, sockets, raw network clients, eval/exec/compile,
+direct file-opening builtins, dynamic attribute introspection, or private/dunder attributes.
+If the BRD requires an LLM call, use my_tools.ask_gpt(messages, temperature=...);
+never access an authenticated model client directly.
 """
 
     user_prompt = ""
@@ -240,12 +232,76 @@ def clean_generated_code(resp_text: str) -> str:
     return code
 
 
+_FORBIDDEN_IMPORT_ROOTS = {
+    "os", "sys", "subprocess", "socket", "requests", "httpx", "urllib", "ftplib",
+    "shutil", "pathlib", "importlib", "builtins", "ctypes", "pickle", "marshal",
+    "inspect", "resource", "signal", "openai", "brd_processor", "source", "job_manager",
+}
+_FORBIDDEN_NAMES = {
+    "exec", "eval", "compile", "open", "__import__", "globals", "locals", "vars",
+    "getattr", "setattr", "delattr", "breakpoint", "input", "help", "exit", "quit",
+    "__builtins__",
+}
+_FORBIDDEN_TOOL_ATTRS = {"gpt_client", "shared_data", "gpt_semaphore"}
+
+
+def _static_safety_check(code: str) -> None:
+    """Reject obvious dangerous constructs before generated/cached code executes.
+
+    This is defense-in-depth, not a sandbox. Generated code still needs process
+    isolation/timeouts for a strong security boundary.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise ValueError(f"code does not parse: {exc}") from exc
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _FORBIDDEN_IMPORT_ROOTS:
+                    raise ValueError(f"line {node.lineno}: import of {alias.name!r} is not allowed")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if node.level or root in _FORBIDDEN_IMPORT_ROOTS:
+                raise ValueError(f"line {node.lineno}: import from {node.module!r} is not allowed")
+            if node.module == "my_tools":
+                for alias in node.names:
+                    if alias.name == "*" or alias.name in _FORBIDDEN_TOOL_ATTRS:
+                        raise ValueError(f"line {node.lineno}: importing {alias.name!r} from my_tools is not allowed")
+        elif isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+            raise ValueError(f"line {node.lineno}: use of {node.id!r} is not allowed")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                raise ValueError(f"line {node.lineno}: private/dunder attribute {node.attr!r} is not allowed")
+            if node.attr in _FORBIDDEN_TOOL_ATTRS:
+                raise ValueError(f"line {node.lineno}: attribute {node.attr!r} is not available to generated code")
+
+
 def _extract_section_body(brd_text: str, heading: str) -> str:
-    """Return text belonging to a numbered BRD section identified by heading text."""
+    """Return a rigid BRD section body by matching a true heading line."""
     lines = brd_text.splitlines()
+    wanted = heading.strip().upper()
+
+    def _normalized_heading(line: str) -> str:
+        text = line.strip()
+        match = re.fullmatch(r"\d+\.\s+(.+)", text)
+        if match:
+            text = match.group(1).strip()
+        return text.rstrip(":").strip().upper()
+
+    def _is_numbered_section_heading(index: int) -> bool:
+        if not re.fullmatch(r"\d+\.\s+\S.*", lines[index].strip()):
+            return False
+        next_index = index + 1
+        while next_index < len(lines) and not lines[next_index].strip():
+            next_index += 1
+        return next_index < len(lines) and bool(re.fullmatch(r"[-=]{3,}", lines[next_index].strip()))
+
     start = None
     for i, line in enumerate(lines):
-        if heading.upper() in line.upper():
+        if _normalized_heading(line) == wanted:
             start = i + 1
             break
     if start is None:
@@ -254,13 +310,11 @@ def _extract_section_body(brd_text: str, heading: str) -> str:
     end = len(lines)
     for i in range(start, len(lines)):
         stripped = lines[i].strip()
-        if i > start and (
-            re.match(r"^\d+\.\s+\S", stripped)
-            or "TECHNICAL DESCRIPTIONS" in stripped.upper()
-        ):
+        if "TECHNICAL DESCRIPTIONS" in stripped.upper() or _is_numbered_section_heading(i):
             end = i
             break
     return "\n".join(lines[start:end])
+
 
 
 def _decode_first_json_value(section_body: str, opening: str, section_name: str):
@@ -464,47 +518,64 @@ def extract_brd_tests(brd_text: str, contract: dict[str, Any]) -> list[tuple[tup
 
 
 _N_ITEMS_TO_PASS_RE = re.compile(r"^N_ITEMS_TO_PASS=([1-9][0-9]*)$")
+_ID_FIELD_RE = re.compile(r"^ID_FIELD=([A-Za-z_][A-Za-z0-9_]*)$")
+_EXPECTED_FIELD_RE = re.compile(r"^EXPECTED_FIELD=([A-Za-z_][A-Za-z0-9_]*)$")
 
 
-def extract_n_items_to_pass(brd_text: str) -> int:
-    """Read the rigid deployment-validation count from JOBS DATA STRUCTURE.
-
-    The BRD must contain exactly one standalone line in that section:
-        N_ITEMS_TO_PASS=<positive integer>
-
-    Example:
-        N_ITEMS_TO_PASS=5
-    """
+def extract_job_directives(brd_text: str) -> dict[str, Any]:
+    """Parse trust-critical job metadata directly from JOBS DATA STRUCTURE."""
     body = _extract_section_body(brd_text, "JOBS DATA STRUCTURE")
-    values: list[int] = []
+    patterns = {
+        "N_ITEMS_TO_PASS": _N_ITEMS_TO_PASS_RE,
+        "ID_FIELD": _ID_FIELD_RE,
+        "EXPECTED_FIELD": _EXPECTED_FIELD_RE,
+    }
+    values: dict[str, list[Any]] = {key: [] for key in patterns}
     malformed: list[str] = []
 
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("N_ITEMS_TO_PASS"):
-            match = _N_ITEMS_TO_PASS_RE.fullmatch(line)
-            if match is None:
-                malformed.append(line)
-            else:
-                values.append(int(match.group(1)))
+        for key, pattern in patterns.items():
+            if line.startswith(key):
+                match = pattern.fullmatch(line)
+                if match is None:
+                    malformed.append(line)
+                else:
+                    value: Any = match.group(1)
+                    if key == "N_ITEMS_TO_PASS":
+                        value = int(value)
+                    values[key].append(value)
+                break
 
     if malformed:
         raise ValueError(
-            "JOBS DATA STRUCTURE contains malformed N_ITEMS_TO_PASS line(s): "
-            f"{malformed!r}. Use exactly N_ITEMS_TO_PASS=<positive integer>, e.g. N_ITEMS_TO_PASS=5"
+            "JOBS DATA STRUCTURE contains malformed directive line(s): "
+            f"{malformed!r}. Required forms are ID_FIELD=<identifier>, "
+            "EXPECTED_FIELD=<identifier>, and N_ITEMS_TO_PASS=<positive integer>."
         )
-    if not values:
+
+    missing = [key for key, found in values.items() if not found]
+    duplicates = [key for key, found in values.items() if len(found) > 1]
+    if missing or duplicates:
         raise ValueError(
-            "JOBS DATA STRUCTURE must contain exactly one standalone line "
-            "N_ITEMS_TO_PASS=<positive integer>, e.g. N_ITEMS_TO_PASS=5"
+            "JOBS DATA STRUCTURE must contain exactly one standalone line for each of "
+            "ID_FIELD=<identifier>, EXPECTED_FIELD=<identifier>, and "
+            f"N_ITEMS_TO_PASS=<positive integer>; missing={missing}, duplicates={duplicates}"
         )
-    if len(values) != 1:
-        raise ValueError(
-            f"JOBS DATA STRUCTURE must contain exactly one N_ITEMS_TO_PASS line; found {len(values)}"
-        )
-    return values[0]
+
+    return {
+        "id_field": values["ID_FIELD"][0],
+        "expected_field": values["EXPECTED_FIELD"][0],
+        "n_items_to_pass": values["N_ITEMS_TO_PASS"][0],
+    }
+
+
+def extract_n_items_to_pass(brd_text: str) -> int:
+    """Backward-compatible helper returning the Python-parsed deployment count."""
+    return int(extract_job_directives(brd_text)["n_items_to_pass"])
+
 
 
 def _load_jobs_list(jobs_path: pathlib.Path) -> list[dict[str, Any]]:
@@ -758,21 +829,44 @@ def gpt_call_with_retry(semaphore, **kwargs):
             "Azure OpenAI is not configured. Set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, "
             "and AZURE_OPENAI_DEPLOYMENT. AZURE_OPENAI_API_VERSION is optional."
         )
-    with semaphore:                               # global quota guard
-        backoff = 1.0
-        for _ in range(_RETRY_STEPS):
-            try:
-                resp = gpt_client.chat.completions.create(model=my_tools.gpt_model, **kwargs)
-                return resp
-            except (RateLimitError, APIStatusError) as exc:
-                if getattr(exc, "status_code", None) != 429:
-                    LOG.exception("GPT hard error")
-                    raise
-            sleep = backoff + random.uniform(0, 0.3)
-            LOG.warning("GPT 429 - retry in %.1fs", sleep)
-            time.sleep(sleep)
-            backoff = min(backoff * 2, 60)
-        raise RuntimeError("GPT call failed after retries")
+
+    call_kwargs = dict(kwargs)
+    backoff = 1.0
+    for _ in range(_RETRY_STEPS):
+        try:
+            with semaphore:
+                return gpt_client.chat.completions.create(model=my_tools.gpt_model, **call_kwargs)
+        except (RateLimitError, APIStatusError) as exc:
+            status = getattr(exc, "status_code", None)
+            message = str(exc).lower()
+            if status == 400 and "temperature" in call_kwargs and "temperature" in message:
+                call_kwargs.pop("temperature", None)
+                LOG.warning("Deployment rejected temperature; retrying without it.")
+                continue
+            if status != 429:
+                LOG.exception("GPT hard error")
+                raise
+
+        sleep = backoff + random.uniform(0, 0.3)
+        LOG.warning("GPT 429 - retry in %.1fs", sleep)
+        time.sleep(sleep)  # semaphore is intentionally released during backoff
+        backoff = min(backoff * 2, 60)
+    raise RuntimeError("GPT call failed after retries")
+
+
+def _generated_ask_gpt(messages, temperature=0):
+    """Narrow LLM wrapper exposed to generated functions; returns message text only."""
+    if _active_gpt_semaphore is None:
+        raise RuntimeError("Generated-code GPT tool is unavailable outside an active BRD worker")
+    kwargs = {"messages": messages}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    resp = gpt_call_with_retry(_active_gpt_semaphore, **kwargs)
+    return resp.choices[0].message.content
+
+
+toolbox.ask_gpt = _generated_ask_gpt
+
 
 
 def _read_done_ids(done_file: pathlib.Path) -> set[str]:
@@ -783,6 +877,20 @@ def _read_done_ids(done_file: pathlib.Path) -> set[str]:
         return set()
 
 
+def _read_rejected_hashes(done_file: pathlib.Path) -> set[str]:
+    try:
+        data = json.loads(done_file.read_text(encoding="utf-8"))
+        rejected = data.get("rejected", {})
+        return set(rejected) if isinstance(rejected, dict) else set()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _runtime_record_hash(record: Any) -> str:
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
 def process_jobs(
     func: Callable[..., Any],
     jobs_schema: Dict[str, Any],
@@ -790,15 +898,12 @@ def process_jobs(
     done_file: Optional[pathlib.Path] = None,
     *,
     output_contract: dict[str, Any] | None = None,
+    input_specs: list[dict[str, Any]] | None = None,
+    results_file: Optional[pathlib.Path] = None,
     preview_limit: int = 1200,
     compare_expected: bool = True,
 ) -> Tuple[bool, Optional[str]]:
-    """Run supplied jobs and enforce the BRD output contract.
-
-    compare_expected=True is available for explicit evaluation workflows. Normal
-    post-deployment processing uses False because correctness was already gated
-    by the first N labeled deployment-validation jobs.
-    """
+    """Run runtime jobs with BRD input/output validation and durable progress state."""
     if not jobs_path.exists():
         LOG.info("No jobs file found for %s - skipping batch run.", jobs_path.name)
         return True, None
@@ -808,7 +913,6 @@ def process_jobs(
     except Exception as exc:
         LOG.error("Failed to read or parse jobs file %s: %s", jobs_path.name, exc, exc_info=True)
         raise
-
     if not isinstance(jobs, list):
         raise ValueError(f"Jobs file {jobs_path.name} must contain a JSON list of records")
     if not jobs:
@@ -818,30 +922,101 @@ def process_jobs(
     param_names: List[str] = list(jobs_schema.get("inputs") or [])
     id_field: Optional[str] = jobs_schema.get("incident_id")
     exp_field: Optional[str] = jobs_schema.get("expected")
+    if not id_field:
+        raise ValueError("Runtime jobs require a Python-parsed ID_FIELD")
 
-    if id_field:
-        if done_file is None:
-            done_file = jobs_path.parent / f"done_{jobs_path.stem}.json"
-        done_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            raw = json.loads(done_file.read_text(encoding="utf-8"))
-            done_ids: Set[str] = set(raw.get("ids", []))
-        except Exception:
-            done_ids = set()
-    else:
+    if done_file is None:
+        done_file = jobs_path.parent / f"done_{jobs_path.stem}.json"
+    if results_file is None:
+        results_file = jobs_path.parent / f"results_{jobs_path.stem}.json"
+    done_file.parent.mkdir(parents=True, exist_ok=True)
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        raw_done = json.loads(done_file.read_text(encoding="utf-8"))
+        done_ids: Set[str] = set(raw_done.get("ids", []))
+        rejected: Dict[str, Any] = dict(raw_done.get("rejected", {}))
+    except Exception:
         done_ids = set()
-        done_file = None
+        rejected = {}
 
-    new_jobs = [rec for rec in jobs if str(rec.get(id_field)) not in done_ids] if id_field else jobs
+    try:
+        raw_results = json.loads(results_file.read_text(encoding="utf-8"))
+        results: Dict[str, Any] = dict(raw_results.get("results", {}))
+    except Exception:
+        results = {}
+
+    def _persist_done() -> None:
+        try:
+            _atomic_write_json(done_file, {"ids": sorted(done_ids), "rejected": rejected})
+        except Exception as exc:
+            LOG.warning("Could not write done file %s: %s", done_file, exc)
+
+    def _persist_results() -> None:
+        try:
+            _atomic_write_json(results_file, {"results": results})
+        except Exception as exc:
+            LOG.warning("Could not write results file %s: %s", results_file, exc)
+
+    new_jobs = []
+    for rec in jobs:
+        record_hash = _runtime_record_hash(rec)
+        if isinstance(rec, dict) and id_field in rec and str(rec[id_field]) in done_ids:
+            continue
+        if record_hash in rejected:
+            continue
+        new_jobs.append(rec)
+
     if not new_jobs:
-        LOG.info("All %d jobs in %s already processed - nothing to do.", len(jobs), jobs_path.name)
+        LOG.info("All actionable jobs in %s are already processed or rejected.", jobs_path.name)
         return True, None
 
-    LOG.info("Batch start for %s: %d new / %d total", jobs_path.name, len(new_jobs), len(jobs))
+    LOG.info("Batch start for %s: %d actionable / %d total", jobs_path.name, len(new_jobs), len(jobs))
 
     for rec in new_jobs:
-        incident_id = str(rec.get(id_field)) if id_field else "?"
-        params = [rec.get(k, "") for k in param_names]
+        record_hash = _runtime_record_hash(rec)
+        incident_id = "?"
+
+        def _reject(reason: str) -> None:
+            rejected[record_hash] = {"incident_id": incident_id, "reason": reason}
+            LOG.warning("incident_id=%s rejected (data validation; function not called): %s", incident_id, reason)
+            _persist_done()
+
+        if not isinstance(rec, dict):
+            _reject("job record must be a JSON object")
+            continue
+        if id_field not in rec or rec[id_field] in (None, ""):
+            _reject(f"missing or empty ID_FIELD {id_field!r}")
+            continue
+
+        incident_id = str(rec[id_field])
+        if incident_id in done_ids:
+            continue
+
+        if input_specs is not None:
+            bad_reason = None
+            for spec in input_specs:
+                name = spec["name"]
+                if name not in rec:
+                    bad_reason = f"missing input field {name!r}"
+                    break
+                ok_in, reason_in = _validate_value_against_contract(rec[name], spec, f"job {incident_id}.{name}")
+                if not ok_in:
+                    bad_reason = reason_in
+                    break
+            if bad_reason is not None:
+                _reject(bad_reason)
+                continue
+
+        if compare_expected and exp_field and exp_field in rec and output_contract is not None:
+            ok_expected, expected_reason = _validate_value_against_contract(
+                rec[exp_field], output_contract, f"job {incident_id}.{exp_field}"
+            )
+            if not ok_expected:
+                _reject(f"invalid expected-answer field: {expected_reason}")
+                continue
+
+        params = [rec[name] for name in param_names]
         try:
             result = func(*params)
 
@@ -855,49 +1030,37 @@ def process_jobs(
                         f"Contract violation: {reason}"
                     )
                     LOG.warning("incident_id=%s: output contract violation: %s", incident_id, reason)
+                    _persist_done()
+                    _persist_results()
                     return False, reflection
 
             if compare_expected and exp_field and exp_field in rec:
                 expected = rec[exp_field]
                 if not _strict_equal(result, expected):
-                    hints: List[str] = []
-                    if isinstance(result, tuple) and isinstance(expected, list):
-                        hints.append("Return a list ([]) not a tuple (()).")
-                    if isinstance(result, (list, tuple)) and isinstance(expected, (list, tuple)) and len(result) != len(expected):
-                        hints.append(f"Sequence length differs: got {len(result)} elements, expected {len(expected)}.")
-                    if isinstance(result, dict) and isinstance(expected, dict):
-                        missing = [k for k in expected if k not in result]
-                        extra = [k for k in result if k not in expected]
-                        if missing:
-                            hints.append(f"Missing keys: {missing}")
-                        if extra:
-                            hints.append(f"Unexpected keys: {extra}")
-
-                    try:
-                        record_json = json.dumps(rec, ensure_ascii=False)
-                    except Exception:
-                        record_json = "<unserializable record>"
-                    if len(record_json) > preview_limit:
-                        record_json = record_json[:preview_limit] + " …<truncated>"
-
                     reflection = (
-                        "Function returned a wrong result on a supplied development job.\n\n"
+                        "Function returned a wrong result on a labeled runtime job.\n\n"
                         f"Inputs passed: {params}\n"
                         f"Expected: {expected!r} (type {type(expected).__name__})\n"
-                        f"Got: {result!r} (type {type(result).__name__})\n"
-                        f"Job record (trimmed JSON): {record_json}"
+                        f"Got: {result!r} (type {type(result).__name__})"
                     )
-                    if hints:
-                        reflection += "\nHints: " + " ".join(hints)
                     LOG.warning(
                         "incident_id=%s: got %r (type %s), expected %r (type %s)",
                         incident_id, result, type(result).__name__, expected, type(expected).__name__,
                     )
+                    _persist_done()
+                    _persist_results()
                     return False, reflection
 
             LOG.info("incident_id=%s: %s", incident_id, result)
-            if id_field and incident_id != "?":
-                done_ids.add(incident_id)
+            results[incident_id] = result
+            _persist_results()  # persist output before marking the job done
+            done_ids.add(incident_id)
+            # If a corrected record for this incident succeeds, clear older rejection entries for that ID.
+            rejected = {
+                key: value for key, value in rejected.items()
+                if not isinstance(value, dict) or value.get("incident_id") != incident_id
+            }
+            _persist_done()
 
         except Exception as exc:
             try:
@@ -914,14 +1077,12 @@ def process_jobs(
                 f"Job record (trimmed JSON): {record_json}"
             )
             LOG.error("incident_id=%s crashed: %s", incident_id, exc, exc_info=True)
+            _persist_done()
+            _persist_results()
             return False, reflection
 
-    if id_field and done_file is not None:
-        try:
-            _atomic_write_json(done_file, {"ids": sorted(done_ids)})
-        except Exception as exc:
-            LOG.warning("Could not write done file %s: %s", done_file, exc)
     return True, None
+
 
 
 
@@ -994,7 +1155,7 @@ def _get_or_create_function(
                 raise RuntimeError(f"Expected exactly one .py file in {handcrafted}; found {len(py_files)}")
             py_path = py_files[0]
             script_name = py_path.name
-            if is_quarantined(registry_path, hash_signature, script_name):
+            if is_quarantined(registry_path, hash_signature, script_name, script_path=py_path):
                 logger.info("Handcrafted impl %s is quarantined; skipping.", script_name)
             else:
                 hc_mod = load_script(namespace=f"hc_{hash_signature}", py_path=py_path)
@@ -1011,7 +1172,9 @@ def _get_or_create_function(
                             "✅ Using handcrafted %s() after passing %d labeled deployment job(s)",
                             expected_function_name, n_items_to_pass,
                         )
-                        return hc_func, expected_function_name, {"origin": "handcrafted", "script_name": script_name}
+                        return hc_func, expected_function_name, {
+                            "origin": "handcrafted", "script_name": script_name, "script_path": str(py_path)
+                        }
                     logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.warning("Handcrafted impl failed BRD-authored tests/contract")
@@ -1029,9 +1192,12 @@ def _get_or_create_function(
         script_name = latest_script
         logger.info("Expected function name: %s() (cache)", func_name)
         try:
-            if is_quarantined(registry_path, hash_signature, script_name):
+            cached_folder = meta.get("folder_name") or hash_signature
+            cached_path = saved_func_dir / cached_folder / script_name
+            if is_quarantined(registry_path, hash_signature, script_name, script_path=cached_path):
                 logger.info("Cached impl %s is quarantined; skipping.", script_name)
             else:
+                _static_safety_check(cached_path.read_text(encoding="utf-8"))
                 cached_mod = load_script(
                     namespace=f"saved_{hash_signature}",
                     saved_func_dir=saved_func_dir,
@@ -1052,7 +1218,9 @@ def _get_or_create_function(
                             "✨ Reusing cached implementation after %d labeled deployment job(s): %s()",
                             n_items_to_pass, func_name,
                         )
-                        return cached_func, func_name, {"origin": "cached", "script_name": script_name}
+                        return cached_func, func_name, {
+                            "origin": "cached", "script_name": script_name, "script_path": str(cached_path)
+                        }
                     logger.info("Cached impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.info("Cache invalid – BRD-authored tests/contract failed")
@@ -1100,6 +1268,17 @@ def _get_or_create_function(
             continue
 
         try:
+            _static_safety_check(code)
+        except Exception as exc:
+            local_reflection = (
+                f"Your code was rejected by the static safety screen: {exc}. "
+                "Do not use OS/process/network client modules, direct file-opening builtins, "
+                "eval/exec/introspection, or private/dunder attributes."
+            )
+            logger.warning("Attempt %d failed static safety screen: %s", attempt, exc)
+            continue
+
+        try:
             ns = {"my_tools": my_tools}
             exec(code, ns)
             func = ns.get(expected_function_name)
@@ -1144,42 +1323,79 @@ def _get_or_create_function(
             saved_func_dir, registry_path, registry_lock,
         )
         logger.info("💾 %s Function saved successfully!", expected_function_name)
-        return func, expected_function_name, {"origin": "gpt", "script_name": saved_name}
+        saved_path = saved_func_dir / brd_path.stem / saved_name
+        return func, expected_function_name, {
+            "origin": "gpt", "script_name": saved_name, "script_path": str(saved_path)
+        }
 
     logger.error("❌ All %d attempts failed for %s", MAX_ATTEMPTS, brd_path.name)
     return None, None, None
 
-# --- Quarantine helpers (add near save_registry/load_registry) ---
+# Quarantine helpers
 def _reg_get(reg: dict, key: str, default):
     v = reg.get(key)
     return v if isinstance(v, type(default)) else default
 
-def is_quarantined(reg_path: pathlib.Path, hash_signature: str, script_name: str) -> bool:
+
+def _source_content_hash(path: pathlib.Path | str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        data = pathlib.Path(path).read_bytes()
+    except Exception:
+        return None
+    return hashlib.blake2s(data, digest_size=16).hexdigest()
+
+
+def is_quarantined(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    script_name: str,
+    script_path: pathlib.Path | str | None = None,
+) -> bool:
     reg = load_registry(reg_path)
     meta = reg.get(hash_signature, {})
-    q = _reg_get(meta, "quarantine", [])
-    for item in q:
-        # match by script name only; keep origin as metadata
-        if item.get("script") == script_name:
-            return True
+    current_content_hash = _source_content_hash(script_path)
+    for item in _reg_get(meta, "quarantine", []):
+        if item.get("script") != script_name:
+            continue
+        quarantined_hash = item.get("content_hash")
+        if quarantined_hash and current_content_hash and quarantined_hash != current_content_hash:
+            continue  # same filename, but the implementation was edited after quarantine
+        return True
     return False
 
-def add_quarantine(reg_path: pathlib.Path, hash_signature: str, script_name: str, origin: str,
-                   reason: str, registry_lock=None) -> None:
+
+def add_quarantine(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    script_name: str,
+    origin: str,
+    reason: str,
+    registry_lock=None,
+    script_path: pathlib.Path | str | None = None,
+) -> None:
+    content_hash = _source_content_hash(script_path)
+
     def _update_registry():
         reg = load_registry(reg_path)
         meta = reg.setdefault(hash_signature, {})
         q = _reg_get(meta, "quarantine", [])
-
-        if any(it.get("script") == script_name for it in q):
+        if any(
+            it.get("script") == script_name
+            and (not content_hash or not it.get("content_hash") or it.get("content_hash") == content_hash)
+            for it in q
+        ):
             return
-
-        q.append({
+        item = {
             "script": script_name,
             "origin": origin,
             "reason": (reason or "")[:400],
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        })
+        }
+        if content_hash:
+            item["content_hash"] = content_hash
+        q.append(item)
         meta["quarantine"] = q
         save_registry(reg_path, reg)
 
@@ -1190,7 +1406,8 @@ def add_quarantine(reg_path: pathlib.Path, hash_signature: str, script_name: str
             _update_registry()
 
 
-###############################   Main Agent fucntion ######################
+
+###############################   Main Agent function ######################
 def process_single_brd_standalone(
     brd_path: pathlib.Path,
     saved_func_dir: pathlib.Path,
@@ -1205,8 +1422,8 @@ def process_single_brd_standalone(
     Perpetually process a single BRD, checking for new jobs at regular intervals.
     Exits only on: per-BRD stop flag, signals, parent death, or IPC failure.
 
-    CHANGE: After MAX_ATTEMPTS failures to generate a function for a given BRD hash,
-    enter a "blocked" state that only logs a periodic warning until the BRD changes.
+    After repeated generation failures or repeated live-batch failures for one BRD
+    hash, enter a blocked state and wait for the BRD to change.
     """
     import signal, os, psutil
     import logging
@@ -1218,9 +1435,9 @@ def process_single_brd_standalone(
     hb_misses_before_exit = HB_MISSES_BEFORE_EXIT
     warn_bad_BRD_every_x_seconds = 20  # only used later; keep here for readability
 
-    # Make tool references available to worker code
-    my_tools.gpt_semaphore = gpt_semaphore
-    my_tools.shared_data = shared_data
+    # Make only the narrow GPT wrapper available to generated code.
+    global _active_gpt_semaphore
+    _active_gpt_semaphore = gpt_semaphore
     registry_lock = shared_data.get("lock") if hasattr(shared_data, "get") else None
 
     # ---------- worker-safe queue handler (NO formatting in worker) ----------
@@ -1329,6 +1546,8 @@ def process_single_brd_standalone(
     cached_contract = None
     cached_brd_tests = None
     cached_n_items_to_pass = None
+    cached_id_field = None
+    cached_expected_field = None
     last_brd_hash = None
     last_reflection = None
     last_impl_meta = None
@@ -1338,6 +1557,7 @@ def process_single_brd_standalone(
     blocked_reason: str | None = None
     next_block_warn_ts: float = 0.0  # throttle warnings to 20s
     schema_fail_count = 0  # consecutive schema-extraction failures -> exponential backoff
+    batch_fail_count = 0
     next_deployment_preflight_warn_ts = 0.0
 
     def _should_stop() -> bool:
@@ -1442,12 +1662,15 @@ def process_single_brd_standalone(
                     blocked_reason = None
                     next_block_warn_ts = 0.0
                     schema_fail_count = 0
+                    batch_fail_count = 0
                     worker_logger.info("BRD content changed — invalidating cache for %s", brd_path.name)
                     cached_func = None
                     cached_schema = None
                     cached_contract = None
                     cached_brd_tests = None
                     cached_n_items_to_pass = None
+                    cached_id_field = None
+                    cached_expected_field = None
                     next_deployment_preflight_warn_ts = 0.0
                     last_reflection = None
                     last_impl_meta = None
@@ -1466,18 +1689,29 @@ def process_single_brd_standalone(
                     continue
 
                 # ----------------- Python-owned BRD contract/tests -----------------
-                if cached_contract is None or cached_brd_tests is None or cached_n_items_to_pass is None:
+                if (
+                    cached_contract is None
+                    or cached_brd_tests is None
+                    or cached_n_items_to_pass is None
+                    or cached_id_field is None
+                    or cached_expected_field is None
+                ):
                     try:
                         contract = extract_brd_contract(brd_text)
                         brd_tests = extract_brd_tests(brd_text, contract)
-                        n_items_to_pass = extract_n_items_to_pass(brd_text)
+                        job_directives = extract_job_directives(brd_text)
+                        n_items_to_pass = job_directives["n_items_to_pass"]
+                        id_field = job_directives["id_field"]
+                        expected_field = job_directives["expected_field"]
                         cached_contract = contract
                         cached_brd_tests = brd_tests
                         cached_n_items_to_pass = n_items_to_pass
+                        cached_id_field = id_field
+                        cached_expected_field = expected_field
                         module_logger.info(
-                            "Parsed BRD inspector data for %s: inputs=%s tests=%d N_ITEMS_TO_PASS=%d",
+                            "Parsed BRD inspector data for %s: inputs=%s tests=%d ID_FIELD=%s EXPECTED_FIELD=%s N_ITEMS_TO_PASS=%d",
                             brd_path.name, [item["name"] for item in contract["input"]],
-                            len(brd_tests), n_items_to_pass,
+                            len(brd_tests), id_field, expected_field, n_items_to_pass,
                         )
                     except Exception as exc:
                         blocked_hash = current_hash
@@ -1493,12 +1727,16 @@ def process_single_brd_standalone(
                     contract = cached_contract
                     brd_tests = cached_brd_tests
                     n_items_to_pass = cached_n_items_to_pass
+                    id_field = cached_id_field
+                    expected_field = cached_expected_field
 
-                # ----------------- Job metadata / function name (cache) -----------------
+                # ----------------- Function name (LLM) + Python-owned job metadata -----------------
                 if cached_schema is None:
                     try:
                         schema = gpt_extract_function_and_data_schema(brd_text, gpt_semaphore)
                         schema["inputs"] = [item["name"] for item in contract["input"]]
+                        schema["incident_id"] = id_field
+                        schema["expected"] = expected_field
                         cached_schema = schema
                         schema_fail_count = 0
                         module_logger.info("Function/job metadata extracted for %s: %s", brd_path.name,
@@ -1521,6 +1759,8 @@ def process_single_brd_standalone(
                 else:
                     schema = cached_schema
                     schema["inputs"] = [item["name"] for item in contract["input"]]
+                    schema["incident_id"] = id_field
+                    schema["expected"] = expected_field
 
                 # ----------------- Deployment-data preflight + ensure function -----------------
                 if cached_func is None:
@@ -1611,15 +1851,22 @@ def process_single_brd_standalone(
                             if not id_field:
                                 raise ValueError("schema has no incident_id field; cannot track processed jobs")
                             done_ids = _read_done_ids(done_file)
-                            new_jobs = [rec for rec in jobs if str(rec.get(id_field)) not in done_ids]
+                            rejected_hashes = _read_rejected_hashes(done_file)
+                            new_jobs = []
+                            for rec in jobs:
+                                if _runtime_record_hash(rec) in rejected_hashes:
+                                    continue
+                                if isinstance(rec, dict) and id_field in rec and str(rec[id_field]) in done_ids:
+                                    continue
+                                new_jobs.append(rec)
                             has_new_jobs = bool(new_jobs)
 
                             if not has_new_jobs and last_jobs_state != "idle":
-                                module_logger.info("No new jobs for %s — all done.", brd_path.name)
+                                module_logger.info("No actionable jobs for %s — all processed or rejected.", brd_path.name)
                                 last_jobs_state = "idle"
                             elif has_new_jobs and last_jobs_state != "pending":
-                                module_logger.info("%d new job(s) for %s (done %d/%d).",
-                                                   len(new_jobs), brd_path.name, total_jobs - len(new_jobs), total_jobs)
+                                module_logger.info("%d actionable job(s) for %s.",
+                                                   len(new_jobs), brd_path.name)
                                 if is_debug_mode:
                                     module_logger.debug("First job preview: %s", json.dumps(new_jobs[0], ensure_ascii=False)[:800])
                                 last_jobs_state = "pending"
@@ -1646,16 +1893,17 @@ def process_single_brd_standalone(
                 ok_batch, reflection = process_jobs(
                     cached_func, jobs_schema, jobs_path, done_file,
                     output_contract=contract["output"],
-                    compare_expected=False,
+                    input_specs=contract["input"],
+                    compare_expected=True,
                 )
                 if ok_batch:
                     worker_logger.info("✅ Jobs processed for %s", brd_path.name)
                     last_reflection = None
+                    batch_fail_count = 0
                     last_activity_time = now
                     time.sleep(check_interval)
                 else:
                     worker_logger.warning("❌ Batch failed for %s: %s", brd_path.name, reflection)
-                    # --- Quarantine the implementation that just failed (suggestion #3) ---
                     try:
                         if last_impl_meta and last_brd_hash == current_hash:
                             add_quarantine(
@@ -1665,16 +1913,29 @@ def process_single_brd_standalone(
                                 origin=last_impl_meta.get("origin", "unknown"),
                                 reason=(reflection or "batch failed"),
                                 registry_lock=registry_lock,
+                                script_path=last_impl_meta.get("script_path"),
                             )
-                            module_logger.info("Quarantined %s (%s) for BRD hash %s",
-                                               last_impl_meta.get("script_name"), last_impl_meta.get("origin"), current_hash)
+                            module_logger.info(
+                                "Quarantined %s (%s) for BRD hash %s",
+                                last_impl_meta.get("script_name"), last_impl_meta.get("origin"), current_hash,
+                            )
                     except Exception as q_exc:
                         module_logger.warning("Failed to quarantine impl: %s", q_exc)
 
                     last_reflection = reflection
-                    cached_func = None          # force regeneration next loop
+                    cached_func = None
                     last_impl_meta = None
+                    batch_fail_count += 1
+                    if batch_fail_count >= MAX_BATCH_FAILURES:
+                        blocked_hash = current_hash
+                        blocked_reason = (
+                            f"{batch_fail_count} consecutive live-batch failures; "
+                            f"last: {(reflection or '')[:200]}"
+                        )
+                        next_block_warn_ts = 0.0
+                        module_logger.warning("Entering blocked mode for %s: %s", brd_path.name, blocked_reason)
                     time.sleep(check_interval)
+
 
             except (BrokenPipeError, EOFError, OSError) as exc:
                 try: worker_logger.info("IPC channel gone (%s) — exiting %s.", type(exc).__name__, brd_path.name)
@@ -1690,6 +1951,8 @@ def process_single_brd_standalone(
                 cached_contract = None
                 cached_brd_tests = None
                 cached_n_items_to_pass = None
+                cached_id_field = None
+                cached_expected_field = None
                 time.sleep(check_interval)
 
     except Exception as exc:
