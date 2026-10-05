@@ -618,7 +618,7 @@ def prepare_deployment_validation_jobs(
     identified from JOBS DATA STRUCTURE. Unlabeled records do not count toward N.
     """
     jobs = _load_jobs_list(jobs_path)
-    exp_field = jobs_schema.get("expected")
+    exp_field = jobs_schema["expected"]
     id_field = jobs_schema.get("incident_id")
     param_names = list(jobs_schema.get("inputs") or [])
 
@@ -680,7 +680,7 @@ def run_deployment_validation_jobs(
     """Require the candidate function to pass the preselected labeled jobs exactly."""
     param_names = list(jobs_schema.get("inputs") or [])
     id_field = jobs_schema.get("incident_id")
-    exp_field = jobs_schema.get("expected")
+    exp_field = jobs_schema["expected"]
 
     for ordinal, rec in enumerate(deployment_jobs, start=1):
         incident_id = str(rec.get(id_field, "?")) if id_field else "?"
@@ -945,7 +945,7 @@ def process_jobs(
 
     param_names: List[str] = list(jobs_schema.get("inputs") or [])
     id_field: Optional[str] = jobs_schema.get("incident_id")
-    exp_field: Optional[str] = jobs_schema.get("expected")
+    exp_field: Optional[str] = jobs_schema["expected"]
     if not id_field:
         raise ValueError("Runtime jobs require a Python-parsed ID_FIELD")
 
@@ -1797,7 +1797,7 @@ def process_single_brd_standalone(
                 if cached_func is None:
                     jobs_schema_for_deploy = {
                         "inputs": [item["name"] for item in contract["input"]],
-                        "expected": schema.get("expected"),
+                        "expected": schema["expected"],
                         "incident_id": schema["incident_id"],
                     }
                     jobs_path_for_deploy = brd_path.with_name(f"{brd_path.stem}_jobs.json")
@@ -1861,8 +1861,8 @@ def process_single_brd_standalone(
                 # ----------------- Jobs derivation -----------------
                 jobs_schema = {
                     "inputs": [item["name"] for item in contract["input"]],
-                    "expected": schema.get("expected"),
-                    "incident_id": schema.get("incident_id") or schema.get("id") or schema.get("job_id"),
+                    "expected": schema["expected"],
+                    "incident_id": schema["incident_id"],
                 }
 
                 jobs_path = brd_path.with_name(f"{brd_path.stem}_jobs.json")
