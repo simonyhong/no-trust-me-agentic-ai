@@ -1,2 +1,3 @@
 openai
 psutil
+python-dotenv
