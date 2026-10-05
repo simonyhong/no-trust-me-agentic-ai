@@ -74,13 +74,15 @@ Python parses these tests directly. The code-generating LLM must not invent, rew
 
 ### JOBS DATA STRUCTURE
 
-This section must describe the runtime job records and contain exactly one standalone deployment-gate line:
+This section must describe the runtime job records and contain exactly one standalone line for each trust-critical directive:
 
 ```text
+ID_FIELD=incident_id
+EXPECTED_FIELD=expected_word_count
 N_ITEMS_TO_PASS=15
 ```
 
-A job is labeled when it contains the BRD-specific expected-output field. Before deployment, a candidate implementation must pass the first `N_ITEMS_TO_PASS` labeled jobs in file order.
+Python parses these directives directly; the LLM does not choose the job ID field or expected-answer field. A job is labeled when it contains `EXPECTED_FIELD`. Before deployment, a candidate implementation must pass the first `N_ITEMS_TO_PASS` labeled jobs in file order.
 
 ## Candidate selection order
 
@@ -96,7 +98,7 @@ Every candidate must pass the same Python-owned validation: all BRD-authored tes
 
 A normal BRD content change invalidates the active in-memory function, clears any previous reflection, reparses the BRD, reruns deployment preflight, and starts normal candidate selection again.
 
-A runtime batch failure is different. The failing implementation is quarantined, the failure reflection is retained, and the next recovery pass skips handcrafted/cache reuse once and goes directly to GPT generation with that reflection.
+A runtime batch failure is different. Runtime inputs are first validated against the BRD contract so malformed job data is rejected without blaming the function. If a valid job exposes a function failure, the implementation is quarantined, the failure reflection is retained, and the next recovery pass skips handcrafted/cache reuse once and goes directly to GPT generation with that reflection. After three consecutive live-batch failures for the same BRD hash, the worker enters blocked mode to stop unbounded regeneration.
 
 ## Setup
 
@@ -131,15 +133,16 @@ python job_manager.py
 
 The manager scans `documents/BRD_*.txt`, launches one worker per BRD up to the concurrency cap, and processes jobs from the matching JSON file.
 
-Runtime state is written to files such as:
+Runtime state and local demonstration outputs are written to files such as:
 
 ```text
 documents/done_BRD_word_count_jobs.json
+documents/results_BRD_word_count_jobs.json
 saved_functions/registry.json
 saved_functions/BRD_word_count/
 ```
 
-Those runtime-generated files are intentionally ignored by Git.
+The results file persists each successfully processed job output. Progress is written incrementally, so jobs completed before a later batch failure are not lost. These runtime-generated files are intentionally ignored by Git.
 
 ## Resetting done-state during debugging
 
@@ -153,13 +156,13 @@ RESET_DONE_STATE=1 python job_manager.py
 
 ## Security notice
 
-Generated Python code currently executes inside the worker process without a sandbox:
+Generated Python code is statically screened before execution, and generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client. However, generated Python still executes inside the worker process:
 
 ```python
 exec(code, ns)
 ```
 
-Run this project only in a controlled environment. Do not expose the generation path to untrusted BRDs, untrusted model output, production credentials, or sensitive data until process isolation, timeouts, and stronger sandboxing are added.
+The static screen is defense-in-depth, not a sandbox. Run this project only in a controlled environment. Do not expose the generation path to untrusted BRDs, untrusted model output, production credentials, or sensitive data until process isolation, timeouts, and stronger sandboxing are added.
 
 ## Public-data caution
 
