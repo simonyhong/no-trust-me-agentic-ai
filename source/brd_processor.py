@@ -140,8 +140,6 @@ def brd_to_function_name(brd_path: pathlib.Path) -> str:
     return function_name
 
 
-def ask_gpt_with_naming_convention_to_make_func
-    
 def ask_gpt_with_naming_convention_to_make_func(
     gpt_semaphore: multiprocessing.Semaphore,
     brd_text: str,
@@ -1604,8 +1602,6 @@ def process_single_brd_standalone(
             return True
 
     worker_logger.info(
-
-    worker_logger.info(
         "Starting perpetual processing for %s (PID=%d, PPID=%d, interval=%ds, debug=%s)",
         brd_path.name, os.getpid(), parent_pid, check_interval, is_debug_mode
     )
@@ -1758,7 +1754,6 @@ def process_single_brd_standalone(
                     brd_path.name, schema["function_name"], id_field, expected_field,
                 )
 
-                # ----------------- Deployment-data preflight + ensure function -----------------
                 # ----------------- Deployment-data preflight + ensure function -----------------
                 if cached_func is None:
                     jobs_schema_for_deploy = {
