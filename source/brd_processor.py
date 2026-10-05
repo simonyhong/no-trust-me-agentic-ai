@@ -12,6 +12,7 @@ import multiprocessing
 import queue
 import openai
 from openai import APIConnectionError, APIStatusError, RateLimitError
+from dotenv import load_dotenv
 from typing import Callable, Any, List, Set, Tuple, Dict, Optional
 import traceback
 import tempfile
@@ -23,6 +24,11 @@ MAX_ATTEMPTS = 10
 MAX_BATCH_FAILURES = 3
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
+
+# Load a developer-local .env file from the repository root if present.
+# Existing shell/environment variables take precedence (override=False).
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -111,56 +117,30 @@ def load_script(*, namespace: str, py_path: pathlib.Path | None = None,
     spec.loader.exec_module(mod)  # type: ignore[attr-defined]
     return mod
 
-def gpt_extract_function_and_data_schema(brd_text: str, gpt_semaphore: multiprocessing.Semaphore) -> dict[str, Any]:
-    """Extract only the Python function name.
-
-    Python, not the LLM, parses the function I/O contract, tests, ID_FIELD,
-    EXPECTED_FIELD, and N_ITEMS_TO_PASS from rigid BRD sections.
-    """
-    SYSTEM = (
-        "You are a technical requirements analyst.\n"
-        "Read the Business Requirement Document (BRD).\n"
-        "Python separately parses all trust-critical contracts, tests, and job metadata.\n"
-        "Choose only the Python function name that best represents the BRD task.\n"
-        "Return exactly ONE line of valid JSON with exactly one key:\n"
-        '  {"function_name":"snake_case_python_identifier"}\n'
-        "No markdown, prose, comments, or additional keys."
-    )
-    resp = gpt_call_with_retry(
-        gpt_semaphore,
-        messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": brd_text}],
-        temperature=0,
-    )
-    txt = resp.choices[0].message.content.strip()
-    try:
-        schema = json.loads(txt)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"GPT function-name JSON invalid: {exc}\n---\n{txt}") from exc
-    if not isinstance(schema, dict) or set(schema) != {"function_name"}:
-        raise ValueError(f"GPT function-name JSON must contain only function_name: {schema!r}")
-    function_name = schema["function_name"]
-    if not isinstance(function_name, str) or not _ID_RE.fullmatch(function_name):
-        raise ValueError(f"GPT returned invalid Python function_name: {function_name!r}")
-    return schema
-
 
 
 _ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")   # valid Python identifier
 def brd_to_function_name(brd_path: pathlib.Path) -> str:
-    """
-    Return the BRD file's stem verbatim (e.g.  BRD_email_router → same).
-    Abort early if the stem cannot be used as a Python identifier.
-    """
-    stem = brd_path.stem            # e.g. BRD_email_router
-    if not stem.startswith("BRD_"):
-        raise ValueError(f"{brd_path.name!s}: expected file name to start with 'BRD_'")
+    """Derive the implementation function name deterministically from the BRD filename.
 
-    if not _ID_RE.fullmatch(stem):
+    Example:
+        BRD_word_count.txt -> word_count
+        BRD_email_router.txt -> email_router
+    """
+    stem = brd_path.stem
+    if not stem.startswith("BRD_"):
+        raise ValueError(f"{brd_path.name}: expected file name to start with 'BRD_'")
+
+    function_name = stem[len("BRD_"):]
+    if not function_name or not _ID_RE.fullmatch(function_name):
         raise ValueError(
-            f"{stem!r} contains characters that are illegal in a Python identifier.\n"
-            "Either rename the BRD file or switch to a snake-case conversion."
+            f"{brd_path.name}: derived function name {function_name!r} is not a valid Python identifier. "
+            "Rename the BRD using BRD_<valid_python_identifier>.txt."
         )
-    return stem                    
+    return function_name
+
+
+def ask_gpt_with_naming_convention_to_make_func
     
 def ask_gpt_with_naming_convention_to_make_func(
     gpt_semaphore: multiprocessing.Semaphore,
@@ -1163,7 +1143,7 @@ def _get_or_create_function(
 ):
     """Load or generate an implementation and let Python enforce the BRD contract/tests."""
     skip_reuse_once = bool(reflection)
-    expected_function_name = schema.get("function_name") or brd_to_function_name(brd_path)
+    expected_function_name = schema["function_name"]
     param_names = [input_spec["name"] for input_spec in contract["input"]]
 
     jobs_schema = {
@@ -1188,9 +1168,28 @@ def _get_or_create_function(
                 logger.info("Handcrafted impl %s is quarantined; skipping.", script_name)
             else:
                 hc_mod = load_script(namespace=f"hc_{hash_signature}", py_path=py_path)
-                if not hasattr(hc_mod, expected_function_name):
-                    raise RuntimeError(f"Handcrafted module must define {expected_function_name}()")
-                hc_func = getattr(hc_mod, expected_function_name)
+                if hasattr(hc_mod, expected_function_name):
+                    hc_func_name = expected_function_name
+                    hc_func = getattr(hc_mod, hc_func_name)
+                else:
+                    public_callables = [
+                        (name, obj)
+                        for name, obj in vars(hc_mod).items()
+                        if not name.startswith("_")
+                        and callable(obj)
+                        and getattr(obj, "__module__", None) == hc_mod.__name__
+                    ]
+                    if len(public_callables) != 1:
+                        raise RuntimeError(
+                            f"Handcrafted module should define {expected_function_name}(), or contain exactly "
+                            f"one public function defined in that module; found {[name for name, _ in public_callables]}"
+                        )
+                    hc_func_name, hc_func = public_callables[0]
+                    logger.info(
+                        "Handcrafted module uses legacy/custom function name %s(); "
+                        "deterministic BRD-derived name is %s().",
+                        hc_func_name, expected_function_name,
+                    )
                 ok_brd, _ = run_brd_tests(hc_func, brd_tests, contract)
                 if ok_brd:
                     ok_deploy, deploy_reflection = run_deployment_validation_jobs(
@@ -1201,7 +1200,7 @@ def _get_or_create_function(
                             "✅ Using handcrafted %s() after passing %d labeled deployment job(s)",
                             expected_function_name, n_items_to_pass,
                         )
-                        return hc_func, expected_function_name, {
+                        return hc_func, hc_func_name, {
                             "origin": "handcrafted", "script_name": script_name, "script_path": str(py_path)
                         }
                     logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
@@ -1572,7 +1571,6 @@ def process_single_brd_standalone(
     hb_miss_count = 0
     last_jobs_state = None
     cached_func = None
-    cached_schema = None
     cached_contract = None
     cached_brd_tests = None
     cached_n_items_to_pass = None
@@ -1586,7 +1584,6 @@ def process_single_brd_standalone(
     blocked_hash: str | None = None
     blocked_reason: str | None = None
     next_block_warn_ts: float = 0.0  # throttle warnings to 20s
-    schema_fail_count = 0  # consecutive schema-extraction failures -> exponential backoff
     batch_fail_count = 0
     next_deployment_preflight_warn_ts = 0.0
 
@@ -1606,16 +1603,7 @@ def process_single_brd_standalone(
         except Exception:
             return True
 
-    def _wait_interruptibly(seconds: float) -> bool:
-        """Wait up to *seconds*. Return True if shutdown/parent loss is detected."""
-        deadline = time.time() + max(0.0, seconds)
-        while True:
-            if _should_stop():
-                return True
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return False
-            time.sleep(min(0.5, remaining))
+    worker_logger.info(
 
     worker_logger.info(
         "Starting perpetual processing for %s (PID=%d, PPID=%d, interval=%ds, debug=%s)",
@@ -1691,11 +1679,9 @@ def process_single_brd_standalone(
                     blocked_hash = None
                     blocked_reason = None
                     next_block_warn_ts = 0.0
-                    schema_fail_count = 0
                     batch_fail_count = 0
                     worker_logger.info("BRD content changed — invalidating cache for %s", brd_path.name)
                     cached_func = None
-                    cached_schema = None
                     cached_contract = None
                     cached_brd_tests = None
                     cached_n_items_to_pass = None
@@ -1760,38 +1746,19 @@ def process_single_brd_standalone(
                     id_field = cached_id_field
                     expected_field = cached_expected_field
 
-                # ----------------- Function name (LLM) + Python-owned job metadata -----------------
-                if cached_schema is None:
-                    try:
-                        schema = gpt_extract_function_and_data_schema(brd_text, gpt_semaphore)
-                        schema["inputs"] = [item["name"] for item in contract["input"]]
-                        schema["incident_id"] = id_field
-                        schema["expected"] = expected_field
-                        cached_schema = schema
-                        schema_fail_count = 0
-                        module_logger.info("Function/job metadata extracted for %s: %s", brd_path.name,
-                                           schema.get("function_name", "<unknown>"))
-                        if is_debug_mode:
-                            module_logger.debug("Schema JSON: %s", json.dumps(schema, ensure_ascii=False))
-                        last_activity_time = now
-                    except Exception as exc:
-                        schema_fail_count += 1
-                        exponent = min(schema_fail_count - 1, 10)
-                        backoff = min(float(check_interval) * (2 ** exponent), 600.0)
-                        module_logger.error(
-                            "Schema extraction failed for %s (attempt %d, next retry in %.0fs): %s",
-                            brd_path.name, schema_fail_count, backoff, exc, exc_info=is_debug_mode,
-                        )
-                        if _wait_interruptibly(backoff):
-                            worker_logger.info("Stop detected during schema retry backoff — exiting %s.", brd_path.name)
-                            break
-                        continue
-                else:
-                    schema = cached_schema
-                    schema["inputs"] = [item["name"] for item in contract["input"]]
-                    schema["incident_id"] = id_field
-                    schema["expected"] = expected_field
+                # ----------------- Python-owned function/job metadata -----------------
+                schema = {
+                    "function_name": brd_to_function_name(brd_path),
+                    "inputs": [item["name"] for item in contract["input"]],
+                    "incident_id": id_field,
+                    "expected": expected_field,
+                }
+                module_logger.info(
+                    "Python-derived metadata for %s: function=%s ID_FIELD=%s EXPECTED_FIELD=%s",
+                    brd_path.name, schema["function_name"], id_field, expected_field,
+                )
 
+                # ----------------- Deployment-data preflight + ensure function -----------------
                 # ----------------- Deployment-data preflight + ensure function -----------------
                 if cached_func is None:
                     jobs_schema_for_deploy = {
@@ -1977,7 +1944,6 @@ def process_single_brd_standalone(
             except Exception as exc:
                 module_logger.exception("Loop error for %s (will retry): %s", brd_path.name, exc)
                 cached_func = None
-                cached_schema = None
                 cached_contract = None
                 cached_brd_tests = None
                 cached_n_items_to_pass = None
