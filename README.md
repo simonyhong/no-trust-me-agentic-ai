@@ -133,7 +133,7 @@ AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=your-deployment-name
 ```
 
-Use one `KEY=value` assignment per line. Do **not** add trailing commas. Quotes are not required.
+Use one `KEY=value` assignment per line. Quotes are not required.
 
 The program automatically loads the repository-root `.env` file. Existing shell/environment variables take precedence over values in `.env`.
 
