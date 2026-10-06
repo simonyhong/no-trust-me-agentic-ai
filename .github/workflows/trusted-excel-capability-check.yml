@@ -1,0 +1,54 @@
+name: Trusted Excel capability check
+
+on:
+  push:
+    branches: [trusted-excel-capability]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile job_manager.py source/brd_processor.py
+      - name: Verify trusted workbook helpers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from openpyxl import Workbook
+
+          path = Path("documents/_trusted_capability_test.xlsx")
+          wb = Workbook()
+          ws = wb.active
+          ws.title = "AP Routing"
+          ws.append(["Supplier Email", "Inbox", "Team Member Assigned", "Queue"])
+          ws.append(["tlhill@cookandboardman.com", "apgen@niagarawater.com", "Jasmine Cuevas", "AP General"])
+          wb.save(path)
+
+          from source import brd_processor as bp
+
+          rows = bp.my_tools.read_excel_rows("./documents/_trusted_capability_test.xlsx", "AP Routing")
+          assert rows[0] == ["Supplier Email", "Inbox", "Team Member Assigned", "Queue"]
+          assert rows[1] == ["tlhill@cookandboardman.com", "apgen@niagarawater.com", "Jasmine Cuevas", "AP General"]
+          assert isinstance(bp.my_tools.file_modified_time("./documents/_trusted_capability_test.xlsx"), float)
+          assert isinstance(bp.my_tools.monotonic_time(), float)
+
+          try:
+              bp.my_tools.read_excel_rows("../requirements.txt", "AP Routing")
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("path escape was not blocked")
+
+          try:
+              bp.my_tools.read_excel_rows(str(path.resolve()), "AP Routing")
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("absolute path was not blocked")
+
+          print("trusted Excel capability: PASS")
+          PY
