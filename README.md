@@ -170,9 +170,21 @@ For debugging only, you can request a reset on startup:
 RESET_DONE_STATE=1 python job_manager.py
 ```
 
+## Trusted generated-code capabilities
+
+Generated functions cannot use `open()` or import `openpyxl` directly. When a BRD legitimately requires a local Excel workbook, the runtime exposes narrowly scoped read-only helpers through `my_tools`:
+
+```python
+my_tools.read_excel_rows("./documents/example.xlsx", "Sheet1")
+my_tools.file_modified_time("./documents/example.xlsx")
+my_tools.monotonic_time()
+```
+
+`read_excel_rows()` only accepts existing `.xlsx`/`.xlsm` files whose resolved path stays under the repository's `documents/` directory. It opens workbooks read-only with `data_only=True`, so generated code can use cached/calculated Excel values without receiving arbitrary filesystem access. `file_modified_time()` is restricted by the same path rules and supports BRD-defined cache refresh logic.
+
 ## Security notice
 
-Generated Python code is statically screened before execution with an import allowlist plus restrictions on dangerous builtins, frame/code-object traversal, private/dunder attributes, and string-format attribute traversal. Generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client. However, generated Python still executes inside the worker process:
+Generated Python code is statically screened before execution with an import allowlist plus restrictions on dangerous builtins, frame/code-object traversal, private/dunder attributes, and string-format attribute traversal. Generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client or unrestricted filesystem access. However, generated Python still executes inside the worker process:
 
 ```python
 exec(code, ns)
