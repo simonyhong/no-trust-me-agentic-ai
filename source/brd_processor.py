@@ -60,11 +60,17 @@ def _resolve_trusted_excel_path(relative_path: str) -> pathlib.Path:
     if requested.is_absolute():
         raise ValueError("Excel path must be relative to the project root")
 
+    candidate = _PROJECT_ROOT / requested
+    normalized = candidate.resolve(strict=False)
+    if _DOCUMENTS_ROOT not in normalized.parents:
+        raise ValueError("Generated code may read Excel files only under documents/")
+
     try:
-        resolved = (_PROJECT_ROOT / requested).resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
     except FileNotFoundError:
         raise FileNotFoundError(f"Excel workbook not found: {relative_path}") from None
 
+    # Re-check after strict resolution so a symlink inside documents/ cannot escape it.
     if _DOCUMENTS_ROOT not in resolved.parents:
         raise ValueError("Generated code may read Excel files only under documents/")
 
