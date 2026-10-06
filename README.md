@@ -110,13 +110,21 @@ Create and activate a Python environment, then install dependencies:
 pip install -r requirements.txt
 ```
 
-Copy the environment template to a private local `.env` file:
+Copy the tracked template to a private local `.env` file.
+
+On PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+On macOS/Linux:
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` and put your real Azure values there:
+Then edit **`.env`**, not `.env.example`, and replace the placeholder values:
 
 ```text
 AZURE_OPENAI_API_KEY=your-real-key
@@ -125,9 +133,11 @@ AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=your-deployment-name
 ```
 
+Use one `KEY=value` assignment per line. Do **not** add trailing commas. Quotes are not required.
+
 The program automatically loads the repository-root `.env` file. Existing shell/environment variables take precedence over values in `.env`.
 
-**Never put a real key in `.env.example`.** That file is a public template. The real `.env` file is ignored by Git.
+**Never put a real key in `.env.example` and never commit `.env`.** The tracked `.env.example` is only a safe template; the real `.env` file is ignored by Git.
 
 ## Run the word-count demo
 
