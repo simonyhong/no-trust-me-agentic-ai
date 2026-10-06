@@ -13,6 +13,7 @@ import queue
 import openai
 from openai import APIConnectionError, APIStatusError, RateLimitError
 from dotenv import load_dotenv
+from openpyxl import load_workbook
 from typing import Callable, Any, List, Set, Tuple, Dict, Optional
 import traceback
 import tempfile
@@ -45,12 +46,75 @@ if AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT:
 
 _active_gpt_semaphore = None
 
+# Trusted, narrow capabilities for generated functions.
+# Generated code still cannot use open(), import openpyxl, or browse arbitrary paths.
+_DOCUMENTS_ROOT = (_PROJECT_ROOT / "documents").resolve()
+
+
+def _resolve_trusted_excel_path(relative_path: str) -> pathlib.Path:
+    """Resolve an Excel workbook path while confining access to documents/."""
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise ValueError("Excel path must be a non-empty relative string")
+
+    requested = pathlib.Path(relative_path)
+    if requested.is_absolute():
+        raise ValueError("Excel path must be relative to the project root")
+
+    try:
+        resolved = (_PROJECT_ROOT / requested).resolve(strict=True)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Excel workbook not found: {relative_path}") from None
+
+    if _DOCUMENTS_ROOT not in resolved.parents:
+        raise ValueError("Generated code may read Excel files only under documents/")
+
+    if resolved.suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise ValueError("Trusted Excel access supports only .xlsx and .xlsm files")
+
+    if not resolved.is_file():
+        raise ValueError(f"Excel path is not a file: {relative_path}")
+
+    return resolved
+
+
+def _trusted_read_excel_rows(relative_path: str, sheet_name: str) -> list[list[Any]]:
+    """Read one worksheet as values-only rows from an approved documents/ workbook."""
+    if not isinstance(sheet_name, str) or not sheet_name.strip():
+        raise ValueError("sheet_name must be a non-empty string")
+
+    path = _resolve_trusted_excel_path(relative_path)
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(
+                f"Worksheet {sheet_name!r} not found in {relative_path!r}; "
+                f"available sheets: {workbook.sheetnames}"
+            )
+        worksheet = workbook[sheet_name]
+        return [list(row) for row in worksheet.iter_rows(values_only=True)]
+    finally:
+        workbook.close()
+
+
+def _trusted_excel_modified_time(relative_path: str) -> float:
+    """Return mtime for an approved documents/ Excel workbook."""
+    return _resolve_trusted_excel_path(relative_path).stat().st_mtime
+
+
+def _trusted_monotonic_time() -> float:
+    """Return a monotonic clock value for safe cache-age calculations."""
+    return time.monotonic()
+
+
 # Synthetic module exposed to generated functions. Keep this surface deliberately small.
 import types
 toolbox = types.ModuleType("my_tools")
 toolbox.log = logging.getLogger("my_tools")
 toolbox.gpt_model = AZURE_OPENAI_DEPLOYMENT
 toolbox.ask_gpt = None
+toolbox.read_excel_rows = _trusted_read_excel_rows
+toolbox.file_modified_time = _trusted_excel_modified_time
+toolbox.monotonic_time = _trusted_monotonic_time
 sys.modules["my_tools"] = toolbox
 import my_tools
 
@@ -175,10 +239,17 @@ types, or output structure. Your job is only to implement the function.
 Return executable Python source code ONLY.
 Do not add prose before or after the code.
 Only import from these modules: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS - {'my_tools'}))}.
-Do not use eval/exec/compile, file access, getattr/introspection, frame objects,
+Do not use eval/exec/compile, direct file access, getattr/introspection, frame objects,
 or private/dunder attributes. Use f-strings, not str.format().
-If the BRD requires an LLM call, use my_tools.ask_gpt(messages, temperature=...);
-never access an authenticated model client directly.
+Do not import openpyxl or use open(). If the BRD requires an Excel workbook under
+the project's documents/ directory, use only these trusted capabilities:
+- my_tools.read_excel_rows(relative_path, sheet_name) -> list of values-only rows.
+  It is read-only and always uses data_only=True.
+- my_tools.file_modified_time(relative_path) -> workbook modification time.
+- my_tools.monotonic_time() -> monotonic clock value for cache-age checks.
+These wrappers reject paths outside documents/ and non-.xlsx/.xlsm files.
+If the BRD requires an LLM call, use my_tools.ask_gpt(messages, temperature=...).
+Never access a raw authenticated model client, shared_data, or a semaphore directly.
 """
 
     user_prompt = ""
@@ -1299,8 +1370,10 @@ def _get_or_create_function(
             local_reflection = (
                 f"Your code was rejected by the static safety screen: {exc}. "
                 f"Only import from: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS - {'my_tools'}))}. "
-                "No eval/exec, file access, getattr/introspection, frame objects, str.format(), "
-                "or private/dunder attributes."
+                "No eval/exec, direct file access, getattr/introspection, frame objects, str.format(), "
+                "or private/dunder attributes. For approved Excel data under documents/, use "
+                "my_tools.read_excel_rows(...), my_tools.file_modified_time(...), and "
+                "my_tools.monotonic_time()."
             )
             logger.warning("Attempt %d failed static safety screen: %s", attempt, exc)
             continue
