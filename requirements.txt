@@ -1,3 +1,4 @@
 openai
 psutil
 python-dotenv
+openpyxl
