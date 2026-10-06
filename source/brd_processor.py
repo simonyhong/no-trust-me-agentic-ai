@@ -1828,10 +1828,11 @@ def process_single_brd_standalone(
                     "incident_id": id_field,
                     "expected": expected_field,
                 }
-                module_logger.info(
-                    "Python-derived metadata for %s: function=%s ID_FIELD=%s EXPECTED_FIELD=%s",
-                    brd_path.name, schema["function_name"], id_field, expected_field,
-                )
+                if brd_changed:
+                    module_logger.info(
+                        "Python-derived metadata for %s: function=%s ID_FIELD=%s EXPECTED_FIELD=%s",
+                        brd_path.name, schema["function_name"], id_field, expected_field,
+                    )
 
                 # ----------------- Deployment-data preflight + ensure function -----------------
                 if cached_func is None:
