@@ -997,4 +997,1240 @@ def _read_rejected_hashes(done_file: pathlib.Path) -> set[str]:
         data = json.loads(done_file.read_text(encoding="utf-8"))
         rejected = data.get("rejected", {})
         return set(rejected) if isinstance(rejected, dict) else set()
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError):        return set()
+
+
+def _runtime_record_hash(record: Any) -> str:
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+class JobDataTemporarilyUnavailable(RuntimeError):
+    """Jobs data was unavailable or incomplete; not a function defect."""
+
+
+def _invoke_monitored(func, *args, phase="function_call", **kwargs):
+    """Mark only generated-function execution for the manager watchdog.
+
+    This is a recovery timeout, not a filesystem/security sandbox. The watchdog
+    may kill this worker while code runs. It is intentionally *not* set while
+    Python waits for the code-generating GPT API.
+    """
+    mark = _active_function_watchdog
+    if mark is not None:
+        mark("start", phase)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if mark is not None:
+            mark("end", phase)
+
+
+_active_function_watchdog = None
+
+
+def process_jobs(
+    func: Callable[..., Any],
+    jobs_schema: Dict[str, Any],
+    jobs_path: pathlib.Path,
+    done_file: Optional[pathlib.Path] = None,
+    *,
+    output_contract: dict[str, Any] | None = None,
+    input_specs: list[dict[str, Any]] | None = None,
+    preview_limit: int = 1200,
+    compare_expected: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """Run runtime jobs with BRD input/output validation and durable progress state."""
+    if not jobs_path.exists():
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} is temporarily missing; will retry"
+        )
+
+    try:
+        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # Upstream writers may be updating the file: this is a DATA problem.
+        # Do not misclassify it as a generated-function failure.
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} unavailable/incomplete: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(jobs, list):
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} is not a JSON list of job records"
+        )
+    if not jobs:
+        LOG.info("Empty jobs file %s - nothing to do.", jobs_path.name)
+        return True, None
+
+    param_names: List[str] = list(jobs_schema.get("inputs") or [])
+    id_field: Optional[str] = jobs_schema.get("incident_id")
+    exp_field: Optional[str] = jobs_schema["expected"]
+    if not id_field:
+        raise ValueError("Runtime jobs require a Python-parsed ID_FIELD")
+
+    if done_file is None:
+        done_file = jobs_path.parent / f"done_{jobs_path.stem}.json"
+    done_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        raw_done = json.loads(done_file.read_text(encoding="utf-8"))
+        done_ids: Set[str] = set(raw_done.get("ids", []))
+        rejected: Dict[str, Any] = dict(raw_done.get("rejected", {}))
+    except Exception:
+        done_ids = set()
+        rejected = {}
+
+    def _persist_done() -> None:
+        # Job answers are logged, not written to a separate results file.
+        # Keep only durable processed/rejected job state.
+        try:
+            _atomic_write_json(done_file, {"ids": sorted(done_ids), "rejected": rejected})
+        except Exception as exc:
+            LOG.warning("Could not write done file %s: %s", done_file, exc)
+
+    new_jobs = []
+    for rec in jobs:
+        record_hash = _runtime_record_hash(rec)
+        if isinstance(rec, dict) and id_field in rec and str(rec[id_field]) in done_ids:
+            continue
+        if record_hash in rejected:
+            continue
+        new_jobs.append(rec)
+
+    if not new_jobs:
+        LOG.info("All actionable jobs in %s are already processed or rejected.", jobs_path.name)
+        return True, None
+
+    LOG.info("Batch start for %s: %d actionable / %d total", jobs_path.name, len(new_jobs), len(jobs))
+    unsaved = 0
+
+    for rec in new_jobs:
+        record_hash = _runtime_record_hash(rec)
+        incident_id = "?"
+
+        def _reject(reason: str) -> None:
+            rejected[record_hash] = {"incident_id": incident_id, "reason": reason}
+            LOG.warning("incident_id=%s rejected (data validation; function not called): %s", incident_id, reason)
+            _persist_done()
+
+        if not isinstance(rec, dict):
+            _reject("job record must be a JSON object")
+            continue
+        if id_field not in rec or rec[id_field] in (None, ""):
+            _reject(f"missing or empty ID_FIELD {id_field!r}")
+            continue
+
+        incident_id = str(rec[id_field])
+        if incident_id in done_ids:
+            continue
+
+        if input_specs is not None:
+            bad_reason = None
+            for spec in input_specs:
+                name = spec["name"]
+                if name not in rec:
+                    bad_reason = f"missing input field {name!r}"
+                    break
+                ok_in, reason_in = _validate_value_against_contract(rec[name], spec, f"job {incident_id}.{name}")
+                if not ok_in:
+                    bad_reason = reason_in
+                    break
+            if bad_reason is not None:
+                _reject(bad_reason)
+                continue
+
+        if compare_expected and exp_field and exp_field in rec and output_contract is not None:
+            ok_expected, expected_reason = _validate_value_against_contract(
+                rec[exp_field], output_contract, f"job {incident_id}.{exp_field}"
+            )
+            if not ok_expected:
+                _reject(f"invalid expected-answer field: {expected_reason}")
+                continue
+
+        params = [rec[name] for name in param_names]
+        try:
+            result = _invoke_monitored(func, *params, phase="live_job")
+
+            if output_contract is not None:
+                valid, reason = _validate_value_against_contract(result, output_contract, "function output")
+                if not valid:
+                    reflection = (
+                        "Function violated the BRD output contract on a supplied job.\n\n"
+                        f"Inputs passed: {params}\n"
+                        f"Got: {result!r} (type {type(result).__name__})\n"
+                        f"Contract violation: {reason}"
+                    )
+                    LOG.warning("incident_id=%s: output contract violation: %s", incident_id, reason)
+                    _persist_done()
+                    return False, reflection
+
+            if compare_expected and exp_field and exp_field in rec:
+                expected = rec[exp_field]
+                if not _strict_equal(result, expected):
+                    reflection = (
+                        "Function returned a wrong result on a labeled runtime job.\n\n"
+                        f"Inputs passed: {params}\n"
+                        f"Expected: {expected!r} (type {type(expected).__name__})\n"
+                        f"Got: {result!r} (type {type(result).__name__})"
+                    )
+                    LOG.warning(
+                        "incident_id=%s: got %r (type %s), expected %r (type %s)",
+                        incident_id, result, type(result).__name__, expected, type(expected).__name__,
+                    )
+                    _persist_done()
+                    return False, reflection
+
+            LOG.info("incident_id=%s: %s", incident_id, result)
+            done_ids.add(incident_id)
+            # If a corrected record for this incident succeeds, clear older rejection entries for that ID.
+            rejected = {
+                key: value for key, value in rejected.items()
+                if not isinstance(value, dict) or value.get("incident_id") != incident_id
+            }
+            unsaved += 1
+            if unsaved >= _PERSIST_EVERY:
+                _persist_done()
+                unsaved = 0
+
+        except Exception as exc:
+            try:
+                record_json = json.dumps(rec, ensure_ascii=False)
+            except Exception:
+                record_json = "<unserializable record>"
+            if len(record_json) > preview_limit:
+                record_json = record_json[:preview_limit] + " …<truncated>"
+            reflection = (
+                "Function crashed on a supplied job.\n\n"
+                f"Exception: {type(exc).__name__}: {exc}\n"
+                f"Traceback (top 2 frames):\n{traceback.format_exc(limit=2)}\n\n"
+                f"Inputs passed: {params}\n"
+                f"Job record (trimmed JSON): {record_json}"
+            )
+            LOG.error("incident_id=%s crashed: %s", incident_id, exc, exc_info=True)
+            _persist_done()
+            return False, reflection
+
+    _persist_done()
+    return True, None
+
+
+
+
+HB_MAX_AGE = 9.0
+HB_MISSES_BEFORE_EXIT = 3
+
+
+def _check_manager_heartbeat_shared(shared_data, max_age: float = 15.0):
+    """
+    Returns (ok, reason). ok=True if a recent heartbeat exists in shared_data.
+    Robust against Manager going away (raises) or missing fields.
+    """
+    try:
+        sd = shared_data.get("shared_dict") if hasattr(shared_data, "get") else shared_data["shared_dict"]
+        hb = sd.get("hb")
+        if not hb:
+            return False, "no_hb_key"
+        ts = float(hb.get("ts", 0))
+        if ts <= 0:
+            return False, "no_ts"
+        age = time.time() - ts
+        if age <= max_age:
+            return True, f"fresh(age={age:.1f}s)"
+        return False, f"stale(age={age:.1f}s)"
+    except (BrokenPipeError, EOFError, OSError) as exc:
+        # Manager server likely dead; treat as no heartbeat
+        return False, f"proxy_error:{type(exc).__name__}"
+    except Exception as exc:
+        return False, f"error:{type(exc).__name__}"
+        
+class BlindDeploymentValidationFailure(RuntimeError):
+    """A generated candidate failed the blind N-job gate.
+
+    Keep this exception's message free of real-job inputs and expected answers:
+    it is for control flow / human escalation, never for GPT reflection.
+    """
+
+
+def _get_or_create_function(
+    brd_path: pathlib.Path,
+    brd_text: str,
+    hash_signature: str,
+    schema: dict,
+    contract: dict[str, Any],
+    brd_tests: list[tuple[tuple[Any, ...], Any, int]],
+    n_items_to_pass: int,
+    deployment_jobs: list[dict[str, Any]],
+    saved_func_dir: pathlib.Path,
+    registry_path: pathlib.Path,
+    gpt_semaphore: multiprocessing.Semaphore,
+    registry_lock,
+    logger,
+    is_debug_mode: bool,
+    reflection: str | None = None,
+):
+    """Load or generate an implementation and let Python enforce the BRD contract/tests."""
+    skip_reuse_once = bool(reflection)
+    expected_function_name = schema["function_name"]
+    param_names = [input_spec["name"] for input_spec in contract["input"]]
+
+    jobs_schema = {
+        "inputs": param_names,
+        "incident_id": schema["incident_id"],
+        "expected": schema["expected"],
+    }
+
+    # [1] Handcrafted implementation.
+    handcrafted = saved_func_dir / f"{brd_path.stem}_handcrafted"
+    if handcrafted.exists() and not skip_reuse_once:
+        logger.info("Found handcrafted dir %s", handcrafted)
+        try:
+            py_files = sorted(handcrafted.glob("*.py"))
+            if not py_files:
+                raise RuntimeError(f"No .py files in {handcrafted}")
+            if len(py_files) > 1:
+                raise RuntimeError(f"Expected exactly one .py file in {handcrafted}; found {len(py_files)}")
+            py_path = py_files[0]
+            script_name = py_path.name
+            if is_quarantined(registry_path, hash_signature, script_name, script_path=py_path):
+                logger.info("Handcrafted impl %s is quarantined; skipping.", script_name)
+            else:
+                hc_mod = load_script(namespace=f"hc_{hash_signature}", py_path=py_path)
+                if hasattr(hc_mod, expected_function_name):
+                    hc_func_name = expected_function_name
+                    hc_func = getattr(hc_mod, hc_func_name)
+                else:
+                    public_callables = [
+                        (name, obj)
+                        for name, obj in vars(hc_mod).items()
+                        if not name.startswith("_")
+                        and callable(obj)
+                        and getattr(obj, "__module__", None) == hc_mod.__name__
+                    ]
+                    if len(public_callables) != 1:
+                        raise RuntimeError(
+                            f"Handcrafted module should define {expected_function_name}(), or contain exactly "
+                            f"one public function defined in that module; found {[name for name, _ in public_callables]}"
+                        )
+                    hc_func_name, hc_func = public_callables[0]
+                    logger.info(
+                        "Handcrafted module uses legacy/custom function name %s(); "
+                        "deterministic BRD-derived name is %s().",
+                        hc_func_name, expected_function_name,
+                    )
+                ok_brd, _ = run_brd_tests(hc_func, brd_tests, contract)
+                if ok_brd:
+                    ok_deploy, deploy_reflection = run_deployment_validation_jobs(
+                        hc_func, jobs_schema, deployment_jobs, contract["output"]
+                    )
+                    if ok_deploy:
+                        logger.info(
+                            "✅ Using handcrafted %s() after passing %d labeled deployment job(s)",
+                            expected_function_name, n_items_to_pass,
+                        )
+                        return hc_func, hc_func_name, {
+                            "origin": "handcrafted", "script_name": script_name, "script_path": str(py_path)
+                        }
+                    logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
+                else:
+                    logger.warning("Handcrafted impl failed BRD-authored tests/contract")
+        except Exception as exc:
+            logger.warning("Handcrafted load/test failed: %s", exc)
+    elif handcrafted.exists() and skip_reuse_once:
+        logger.info("Previous batch failure -> skipping handcrafted reuse this loop.")
+
+    # [2] Cached implementation.
+    registry = load_registry(registry_path)
+    meta = registry.get(hash_signature, {})
+    latest_script = meta.get("latest_script") if isinstance(meta, dict) else None
+    if latest_script and not skip_reuse_once:
+        func_name = meta.get("function_name") or expected_function_name
+        script_name = latest_script
+        logger.info("Expected function name: %s() (cache)", func_name)
+        try:
+            cached_folder = meta.get("folder_name") or hash_signature
+            cached_path = saved_func_dir / cached_folder / script_name
+            if is_quarantined(registry_path, hash_signature, script_name, script_path=cached_path):
+                logger.info("Cached impl %s is quarantined; skipping.", script_name)
+            else:
+                _static_safety_check(cached_path.read_text(encoding="utf-8"))
+                cached_mod = _invoke_monitored(
+                    load_script, phase="cached_code_load",
+                    namespace=f"saved_{hash_signature}",
+                    saved_func_dir=saved_func_dir,
+                    hash_signature=hash_signature,
+                    script_name=script_name,
+                    registry_path=registry_path,
+                )
+                if not hasattr(cached_mod, func_name):
+                    raise RuntimeError(f"Cached module missing {func_name}()")
+                cached_func = getattr(cached_mod, func_name)
+                ok_brd, _ = run_brd_tests(cached_func, brd_tests, contract)
+                if ok_brd:
+                    ok_deploy, deploy_reflection = run_deployment_validation_jobs(
+                        cached_func, jobs_schema, deployment_jobs, contract["output"]
+                    )
+                    if ok_deploy:
+                        logger.info(
+                            "✨ Reusing cached implementation after %d labeled deployment job(s): %s()",
+                            n_items_to_pass, func_name,
+                        )
+                        return cached_func, func_name, {
+                            "origin": "cached", "script_name": script_name, "script_path": str(cached_path)
+                        }
+                    logger.info("Cached impl failed labeled deployment validation: %s", deploy_reflection)
+                else:
+                    logger.info("Cache invalid – BRD-authored tests/contract failed")
+        except Exception as exc:
+            logger.warning("Cache load/test failed: %s", exc)
+    elif latest_script and skip_reuse_once:
+        logger.info("Previous batch failure -> skipping cached reuse this loop.")
+
+    # [3] GPT generation. GPT writes code only; Python owns inspection.
+    logger.info("🤖 Proceeding to GPT generation...")
+    generation_contract = {
+        "function_name": expected_function_name,
+        "input": contract["input"],
+        "output": contract["output"],
+    }
+    schema_lock_header = (
+        "🚨 USE THIS FUNCTION CONTRACT EXACTLY - do not add/remove parameters or alter output shape! 🚨\n"
+        f"{json.dumps(generation_contract, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    )
+
+    local_reflection = reflection
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.info("Attempt %d/%d for %s()", attempt, MAX_ATTEMPTS, expected_function_name)
+        try:
+            resp = ask_gpt_with_naming_convention_to_make_func(
+                gpt_semaphore,
+                schema_lock_header + brd_text,
+                expected_function_name,
+                param_names,
+                local_reflection,
+            )
+            logger.info("GPT response received - length: %d chars", len(resp))
+            if is_debug_mode:
+                logger.info("GPT response:\n%s", resp)
+        except Exception as exc:
+            local_reflection = f"GPT call failed with error: {type(exc).__name__}: {exc}"
+            logger.warning("Attempt %d failed at GPT call: %s", attempt, exc)
+            continue
+
+        try:
+            code = clean_generated_code(resp)
+        except Exception as exc:
+            local_reflection = f"Return executable Python source code only. {type(exc).__name__}: {exc}"
+            logger.warning("Attempt %d failed at code parsing: %s", attempt, exc)
+            continue
+
+        try:
+            _static_safety_check(code)
+        except Exception as exc:
+            local_reflection = (
+                f"Your code was rejected by the static safety screen: {exc}. "
+                f"Only import from: {', '.join(sorted(_ALLOWED_IMPORT_ROOTS - {'my_tools'}))}. "
+                "No eval/exec, direct file access, getattr/introspection, frame objects, str.format(), "
+                "or private/dunder attributes. For approved Excel data under documents/, use "
+                "my_tools.read_excel_rows(...), my_tools.file_modified_time(...), and "
+                "my_tools.monotonic_time()."
+            )
+            logger.warning("Attempt %d failed static safety screen: %s", attempt, exc)
+            continue
+
+        try:
+            ns = {"my_tools": my_tools}
+            _invoke_monitored(exec, code, ns, phase="generated_code_load")
+            func = ns.get(expected_function_name)
+            if not callable(func):
+                raise ValueError(f"Function {expected_function_name} not found or not callable")
+            logger.info("Code compilation successful - function %s loaded", expected_function_name)
+        except Exception as exc:
+            local_reflection = f"Your code did not compile:\n{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}"
+            logger.warning("Attempt %d failed at compilation: %s", attempt, exc)
+            continue
+
+        ok_brd, feedback = run_brd_tests(func, brd_tests, contract)
+        if not ok_brd:
+            failed = "\n".join([ln for ln in feedback if " -> OK " not in ln][:8])
+            local_reflection = (
+                "Your function failed the user's BRD contract/tests as executed by Python. "
+                "Do not change or reinterpret the contract or expected outputs. Fix only the implementation.\n"
+                f"{failed}"
+            )
+            logger.warning("Attempt %d failed BRD-authored tests/contract", attempt)
+            continue
+
+        # Deployment gate: exactly the first N labeled jobs selected by Python.
+        ok_deploy, reflection2 = run_deployment_validation_jobs(
+            func, jobs_schema, deployment_jobs, contract["output"]
+        )
+        if not ok_deploy:
+            # BLIND HOLDOUT: the Python validator may log the failure for a human,
+            # but MUST NOT pass reflection2 (inputs/expected/actual) to GPT.
+            # Unlike BRD-authored example failures, a failed real-job test does
+            # not trigger another generation attempt for this BRD hash.
+            logger.error(
+                "Blind deployment gate failed after BRD examples passed "
+                "(attempt %d, N_ITEMS_TO_PASS=%d). "
+                "Rejecting candidate and escalating to a human; no real-job feedback to GPT.",
+                attempt, n_items_to_pass,
+            )
+            raise BlindDeploymentValidationFailure(
+                f"Generated candidate failed blind validation on the first "
+                f"{n_items_to_pass} labeled real jobs. Human review required; "
+                "no real-job data was sent to the code-generating LLM."
+            )
+
+        logger.info(
+            "✅ Success on attempt %d after BRD tests + %d labeled deployment job(s)!",
+            attempt, n_items_to_pass,
+        )
+        logger.info("🔍 Saving function with hash: %s", hash_signature)
+        saved_name = save_source(
+            hash_signature, code, expected_function_name, brd_path,
+            saved_func_dir, registry_path, registry_lock,
+        )
+        logger.info("💾 %s Function saved successfully!", expected_function_name)
+        saved_path = saved_func_dir / brd_path.stem / saved_name
+        return func, expected_function_name, {
+            "origin": "gpt", "script_name": saved_name, "script_path": str(saved_path)
+        }
+
+    logger.error("❌ All %d attempts failed for %s", MAX_ATTEMPTS, brd_path.name)
+    return None, None, None
+
+# Quarantine helpers
+def _reg_get(reg: dict, key: str, default):
+    v = reg.get(key)
+    return v if isinstance(v, type(default)) else default
+
+
+def _source_content_hash(path: pathlib.Path | str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        data = pathlib.Path(path).read_bytes()
+    except Exception:
+        return None
+    return hashlib.blake2s(data, digest_size=16).hexdigest()
+
+
+def is_quarantined(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    script_name: str,
+    script_path: pathlib.Path | str | None = None,
+) -> bool:
+    reg = load_registry(reg_path)
+    meta = reg.get(hash_signature, {})
+    current_content_hash = _source_content_hash(script_path)
+    for item in _reg_get(meta, "quarantine", []):
+        if item.get("script") != script_name:
+            continue
+        quarantined_hash = item.get("content_hash")
+        if quarantined_hash and current_content_hash and quarantined_hash != current_content_hash:
+            continue  # same filename, but the implementation was edited after quarantine
+        return True
+    return False
+
+
+def add_quarantine(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    script_name: str,
+    origin: str,
+    reason: str,
+    registry_lock=None,
+    script_path: pathlib.Path | str | None = None,
+) -> None:
+    content_hash = _source_content_hash(script_path)
+
+    def _update_registry():
+        reg = load_registry(reg_path)
+        meta = reg.setdefault(hash_signature, {})
+        q = _reg_get(meta, "quarantine", [])
+        if any(
+            it.get("script") == script_name
+            and (not content_hash or not it.get("content_hash") or it.get("content_hash") == content_hash)
+            for it in q
+        ):
+            return
+        item = {
+            "script": script_name,
+            "origin": origin,
+            "reason": (reason or "")[:400],
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        if content_hash:
+            item["content_hash"] = content_hash
+        q.append(item)
+        meta["quarantine"] = q
+        save_registry(reg_path, reg)
+
+    if registry_lock is None:
+        _update_registry()
+    else:
+        with registry_lock:
+            _update_registry()
+
+
+
+###############################   Main Agent function ######################
+def process_single_brd_standalone(
+    brd_path: pathlib.Path,
+    saved_func_dir: pathlib.Path,
+    registry_path: pathlib.Path,
+    gpt_semaphore: multiprocessing.Semaphore,
+    log_queue: multiprocessing.Queue,
+    shared_data,
+    is_debug_mode: bool = False,
+    check_interval: int = 5,
+) -> None:
+    """
+    Perpetually process a single BRD, checking for new jobs at regular intervals.
+    Exits only on: per-BRD stop flag, signals, parent death, or IPC failure.
+
+    A valid live-job execution failure immediately quarantines the implementation
+    and blocks this BRD hash for human review; no automatic GPT regeneration.
+    Blocks are persisted across restarts in the registry.
+    """
+    import signal, os, psutil
+    import logging
+    import logging.handlers
+
+    # ---------- local constants (no dependency on job_manager.py) ----------
+    WORKER_MAX_RECORD_BYTES = 64_000
+    hb_max_age = HB_MAX_AGE
+    hb_misses_before_exit = HB_MISSES_BEFORE_EXIT
+    warn_bad_BRD_every_x_seconds = 20  # only used later; keep here for readability
+
+    # Make only the narrow GPT wrapper available to generated code.
+    global _active_gpt_semaphore
+    _active_gpt_semaphore = gpt_semaphore
+    registry_lock = shared_data.get("lock") if hasattr(shared_data, "get") else None
+
+    # ---------- worker-safe queue handler (NO formatting in worker) ----------
+    class _WorkerQueueHandler(logging.handlers.QueueHandler):
+        def __init__(self, q, max_bytes: int = WORKER_MAX_RECORD_BYTES):
+            super().__init__(q)
+            self._dead = False
+            self._max = max_bytes
+
+        def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+            # Always render the message now; args can contain objects that cannot be pickled.
+            record.msg = record.getMessage()
+            record.args = None
+
+            # Traceback objects are not picklable. Preserve ERROR+ tracebacks as plain text.
+            if record.exc_info:
+                if record.levelno >= logging.ERROR and not record.exc_text:
+                    record.exc_text = logging.Formatter().formatException(record.exc_info)
+                record.exc_info = None
+            if record.levelno < logging.ERROR:
+                record.exc_text = None
+                record.stack_info = None
+
+            if isinstance(record.msg, str) and len(record.msg) > self._max:
+                record.msg = record.msg[: self._max] + " …<truncated>"
+            return record
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if self._dead:
+                return
+            try:
+                self.enqueue(self.prepare(record))
+            except queue.Full:
+                pass  # transient back-pressure: drop only this record, keep the handler alive
+            except Exception:
+                self._dead = True  # permanent IPC failure: fuse off quietly
+
+        def close(self) -> None:
+            self._dead = True
+            try:
+                super().close()
+            except Exception:
+                pass
+
+    # ---------- logging hookup: ONE handler, multiple loggers ----------
+    worker_name = f"JobWorker.{brd_path.stem}"
+
+    # The per-worker logger (lifecycle + high-level events)
+    worker_logger = logging.getLogger(worker_name)
+    worker_logger.setLevel(logging.DEBUG if is_debug_mode else logging.INFO)
+    worker_logger.propagate = False
+
+    # Module logger used across this file (stable name for uniform logs)
+    module_logger = logging.getLogger("brd_processor")
+    module_logger.setLevel(logging.DEBUG if is_debug_mode else logging.INFO)
+    module_logger.propagate = False
+
+    # Logger exposed to generated code via my_tools.log
+    tools_logger = logging.getLogger(f"{worker_name}.my_tools")
+    tools_logger.setLevel(logging.DEBUG if is_debug_mode else logging.INFO)
+    tools_logger.propagate = False
+    my_tools.log = tools_logger  # rebind toolbox logger for generated code
+
+    # Create ONE queue handler (NO formatter here; manager formats)
+    qh = _WorkerQueueHandler(log_queue)
+
+    # Remove any stale handlers (important when workers restart)
+    for lg in (worker_logger, module_logger, tools_logger):
+        for h in list(lg.handlers):
+            try:
+                lg.removeHandler(h)
+                h.close()
+            except Exception:
+                pass
+        lg.addHandler(qh)
+
+    # Quiet noisy third-party libs (levels only; no handlers added here)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    # ---------- signals ----------
+    shutdown_requested = False
+    def _on_signal(signum, frame):
+        nonlocal shutdown_requested
+        try: worker_logger.info("Received signal %d — shutting down %s", signum, brd_path.name)
+        except Exception: pass
+        shutdown_requested = True
+    for s in (getattr(signal, "SIGTERM", None),
+              getattr(signal, "SIGINT", None),
+              getattr(signal, "SIGHUP", None)):
+        if s:
+            try: signal.signal(s, _on_signal)
+            except Exception: pass
+
+    # ---------- runtime state ----------
+    # Each spawned BRD worker owns its own monitoring callback. Only an active
+    # function call is timed; regular polling and GPT code generation are not.
+    global _active_function_watchdog
+    def _mark_function_call(event: str, phase: str) -> None:
+        key = f"function_call::{brd_path.name}"
+        try:
+            shared = shared_data["shared_dict"]
+            if event == "start":
+                shared[key] = {
+                    "pid": os.getpid(),
+                    "started_monotonic": time.monotonic(),
+                    "phase": phase,
+                }
+            else:
+                state = shared.get(key)
+                if isinstance(state, dict) and state.get("pid") == os.getpid():
+                    shared.pop(key, None)
+        except (OSError, EOFError, BrokenPipeError):
+            pass  # Manager loss is handled separately by the worker lifecycle.
+
+    _active_function_watchdog = _mark_function_call
+    parent_pid = os.getppid()
+    heartbeat_interval = 10.0
+    last_heartbeat_check = time.time()
+    last_activity_time = time.time()
+    max_idle_time = None  # run forever unless set
+    hb_miss_count = 0
+    last_jobs_state = None
+    cached_func = None
+    cached_contract = None
+    cached_brd_tests = None
+    cached_n_items_to_pass = None
+    cached_id_field = None
+    cached_expected_field = None
+    last_brd_hash = None
+    last_reflection = None
+    last_impl_meta = None
+
+    # Blocked state: persisted in registry by BRD hash, remains until human changes BRD.
+    blocked_hash: str | None = None
+    blocked_reason: str | None = None
+    next_block_warn_ts: float = 0.0  # throttle warnings to 20s
+    next_deployment_preflight_warn_ts = 0.0
+
+    def _should_stop() -> bool:
+        if shutdown_requested:
+            return True
+        try:
+            sd = shared_data.get("shared_dict") if hasattr(shared_data, "get") else shared_data["shared_dict"]
+            if sd.get(f"stop::{brd_path.name}", False) or sd.get("shutdown_requested", False):
+                return True
+        except (BrokenPipeError, EOFError, OSError):
+            return True
+        except Exception:
+            pass
+        try:
+            return (not psutil.pid_exists(parent_pid)) or os.getppid() != parent_pid
+        except Exception:
+            return True
+
+    worker_logger.info(
+        "Starting perpetual processing for %s (PID=%d, PPID=%d, interval=%ds, debug=%s)",
+        brd_path.name, os.getpid(), parent_pid, check_interval, is_debug_mode
+    )
+
+    try:
+        while not shutdown_requested:
+            try:
+                now = time.time()
+
+                # per-BRD stop flag / global shutdown
+                try:
+                    if isinstance(shared_data, dict) and "shared_dict" in shared_data:
+                        sd = shared_data["shared_dict"]
+                        if sd.get(f"stop::{brd_path.name}", False):
+                            worker_logger.info("Stop flag detected for %s — exiting.", brd_path.name)
+                            break
+                        if sd.get("shutdown_requested", False):
+                            worker_logger.info("Global shutdown flag detected — exiting %s.", brd_path.name)
+                            break
+                except Exception:
+                    pass
+
+                # parent-alive check
+                if now - last_heartbeat_check >= heartbeat_interval:
+                    try:
+                        if not psutil.pid_exists(parent_pid) or os.getppid() != parent_pid:
+                            worker_logger.info("Parent appears gone — exiting %s.", brd_path.name)
+                            break
+                    except Exception:
+                        worker_logger.info("Parent check failed — assuming parent gone; exiting %s.", brd_path.name)
+                        break
+                    finally:
+                        last_heartbeat_check = now
+
+                # manager heartbeat
+                ok_hb, hb_reason = _check_manager_heartbeat_shared(shared_data, hb_max_age)
+                if not ok_hb:
+                    hb_miss_count += 1
+                    if hb_miss_count == 1:
+                        worker_logger.warning("Manager heartbeat check failed (%s) — will recheck.", hb_reason)
+                    if hb_miss_count >= hb_misses_before_exit:
+                        worker_logger.info("Manager heartbeat stale after %d checks — exiting %s.",
+                                           hb_miss_count, brd_path.name)
+                        break
+                else:
+                    if hb_miss_count:
+                        worker_logger.info("Manager heartbeat recovered after %d misses (%s).",
+                                           hb_miss_count, hb_reason)
+                    hb_miss_count = 0
+
+                # idle timeout (disabled)
+                if max_idle_time and (now - last_activity_time > max_idle_time):
+                    worker_logger.info("Idle timeout (>%ss) — exiting %s.", max_idle_time, brd_path.name)
+                    break
+
+                # ----------------- BRD read & hash -----------------
+                try:
+                    brd_text = brd_path.read_text(encoding="utf-8")
+                    current_hash = brd_hash_signature(brd_text)
+                except FileNotFoundError:
+                    worker_logger.info("BRD file %s deleted mid-loop — exiting worker.", brd_path.name)
+                    break
+                except Exception as exc:
+                    module_logger.error("Failed to read BRD %s: %s", brd_path.name, exc, exc_info=is_debug_mode)
+                    time.sleep(check_interval)
+                    continue
+
+                # if we were blocked and the BRD changed, unblock
+                brd_changed = (last_brd_hash != current_hash)
+                if brd_changed:
+                    blocked_hash = None
+                    blocked_reason = None
+                    next_block_warn_ts = 0.0
+                    worker_logger.info("BRD content changed — invalidating cache for %s", brd_path.name)
+                    # Only the current BRD's hash is relevant; old hash blocks stay archived
+                    # until the manager's normal registry cleanup prunes them.
+                    persisted_block = get_brd_runtime_block(registry_path, current_hash)
+                    if persisted_block:
+                        blocked_hash = current_hash
+                        blocked_reason = persisted_block.get("reason", "human review required")
+                    cached_func = None
+                    cached_contract = None
+                    cached_brd_tests = None
+                    cached_n_items_to_pass = None
+                    cached_id_field = None
+                    cached_expected_field = None
+                    next_deployment_preflight_warn_ts = 0.0
+                    last_reflection = None
+                    last_impl_meta = None
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
+                    last_brd_hash = current_hash
+                    last_activity_time = now
+
+                # -------------- BLOCKED MODE: no GPT calls, warn every x seconds --------------
+                if blocked_hash == current_hash:
+                    if now >= next_block_warn_ts:
+                        module_logger.warning(
+                            "BRD %s is blocked: %s. Waiting for BRD to change.",
+                            brd_path.name, blocked_reason or "no working function",
+                        )
+                        next_block_warn_ts = now + warn_bad_BRD_every_x_seconds
+                    time.sleep(min(5.0, check_interval * 2))
+                    continue
+
+                # ----------------- Python-owned BRD contract/tests -----------------
+                if (
+                    cached_contract is None
+                    or cached_brd_tests is None
+                    or cached_n_items_to_pass is None
+                    or cached_id_field is None
+                    or cached_expected_field is None
+                ):
+                    try:
+                        contract = extract_brd_contract(brd_text)
+                        brd_tests = extract_brd_tests(brd_text, contract)
+                        job_directives = extract_job_directives(brd_text)
+                        n_items_to_pass = job_directives["n_items_to_pass"]
+                        id_field = job_directives["id_field"]
+                        expected_field = job_directives["expected_field"]
+                        cached_contract = contract
+                        cached_brd_tests = brd_tests
+                        cached_n_items_to_pass = n_items_to_pass
+                        cached_id_field = id_field
+                        cached_expected_field = expected_field
+                        module_logger.info(
+                            "Parsed BRD inspector data for %s: inputs=%s tests=%d ID_FIELD=%s EXPECTED_FIELD=%s N_ITEMS_TO_PASS=%d",
+                            brd_path.name, [item["name"] for item in contract["input"]],
+                            len(brd_tests), id_field, expected_field, n_items_to_pass,
+                        )
+                    except Exception as exc:
+                        blocked_hash = current_hash
+                        blocked_reason = (
+                            "invalid FUNCTION INPUT/OUTPUT CONTRACT, TEST EXAMPLES, or JOBS DATA STRUCTURE "
+                            f"inspector data ({exc})"
+                        )
+                        next_block_warn_ts = 0.0
+                        module_logger.error("BRD inspector data invalid for %s: %s", brd_path.name, exc)
+                        time.sleep(check_interval)
+                        continue
+                else:
+                    contract = cached_contract
+                    brd_tests = cached_brd_tests
+                    n_items_to_pass = cached_n_items_to_pass
+                    id_field = cached_id_field
+                    expected_field = cached_expected_field
+
+                # ----------------- Python-owned function/job metadata -----------------
+                schema = {
+                    "function_name": brd_to_function_name(brd_path),
+                    "inputs": [item["name"] for item in contract["input"]],
+                    "incident_id": id_field,
+                    "expected": expected_field,
+                }
+                if brd_changed:
+                    module_logger.info(
+                        "Python-derived metadata for %s: function=%s ID_FIELD=%s EXPECTED_FIELD=%s",
+                        brd_path.name, schema["function_name"], id_field, expected_field,
+                    )
+
+                # ----------------- Deployment-data preflight + ensure function -----------------
+                if cached_func is None:
+                    jobs_schema_for_deploy = {
+                        "inputs": [item["name"] for item in contract["input"]],
+                        "expected": schema["expected"],
+                        "incident_id": schema["incident_id"],
+                    }
+                    jobs_path_for_deploy = brd_path.with_name(f"{brd_path.stem}_jobs.json")
+
+                    try:
+                        deployment_jobs, labeled_count = prepare_deployment_validation_jobs(
+                            jobs_path_for_deploy, jobs_schema_for_deploy, contract, n_items_to_pass
+                        )
+                        next_deployment_preflight_warn_ts = 0.0
+                        module_logger.info(
+                            "Deployment preflight for %s: using first %d labeled job(s) out of %d labeled",
+                            brd_path.name, n_items_to_pass, labeled_count,
+                        )
+                    except Exception as exc:
+                        # Do not call the implementation-generating LLM while deployment is impossible.
+                        # We intentionally keep the worker alive and recheck the jobs file; exiting here
+                        # would make the current JobManager immediately restart the worker in a loop.
+                        if now >= next_deployment_preflight_warn_ts:
+                            module_logger.warning(
+                                "Deployment preflight blocked for %s: %s. No function will be generated/deployed "
+                                "until the jobs data satisfies N_ITEMS_TO_PASS=%d.",
+                                brd_path.name, exc, n_items_to_pass,
+                            )
+                            next_deployment_preflight_warn_ts = now + warn_bad_BRD_every_x_seconds
+                        time.sleep(min(5.0, check_interval * 2))
+                        continue
+
+                    try:
+                        func, func_name, impl_meta = _get_or_create_function(
+                            brd_path=brd_path,
+                            brd_text=brd_text,
+                            hash_signature=current_hash,
+                            schema=schema,
+                            contract=contract,
+                            brd_tests=brd_tests,
+                            n_items_to_pass=n_items_to_pass,
+                            deployment_jobs=deployment_jobs,
+                            saved_func_dir=saved_func_dir,
+                            registry_path=registry_path,
+                            gpt_semaphore=gpt_semaphore,
+                            registry_lock=registry_lock,
+                            logger=module_logger,
+                            is_debug_mode=is_debug_mode,
+                            reflection=last_reflection,
+                        )
+                    except BlindDeploymentValidationFailure as exc:
+                        # Do not retry, regenerate, or send any blind-test data to GPT.
+                        blocked_hash = current_hash
+                        blocked_reason = str(exc)
+                        next_block_warn_ts = 0.0
+                        last_reflection = None
+                        block_brd_until_changed(
+                            registry_path, current_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="blind_deployment",
+                        )
+                        module_logger.error(
+                            "Blind deployment validation stopped %s: %s "
+                            "Waiting for human BRD review/change.",
+                            brd_path.name, exc,
+                        )
+                        time.sleep(check_interval)
+                        continue
+                    if func is None:
+                        # Enter blocked mode for this BRD hash
+                        blocked_hash = current_hash
+                        blocked_reason = f"no working function after up to {MAX_ATTEMPTS} generation attempts; see earlier ERROR"                        next_block_warn_ts = 0.0
+                        module_logger.warning(
+                            "Entering blocked mode for %s: %s. Will warn every %ss until BRD changes.",
+                            brd_path.name, blocked_reason, warn_bad_BRD_every_x_seconds,
+                        )
+                        time.sleep(check_interval * 2)
+                        continue
+
+                    cached_func = func
+                    last_impl_meta = impl_meta or {"origin": "unknown", "script_name": "<unknown>"}
+                    try:
+                        shared_data["shared_dict"][f"active_impl::{brd_path.name}"] = {
+                            "hash": current_hash,
+                            "origin": last_impl_meta.get("origin", "unknown"),
+                            "script_name": last_impl_meta.get("script_name", "<unknown>"),
+                            "script_path": last_impl_meta.get("script_path"),
+                        }
+                    except Exception as exc:
+                        module_logger.warning("Cannot publish active implementation metadata: %s", exc)
+                    last_activity_time = now
+
+                # ----------------- Jobs derivation -----------------
+                jobs_schema = {
+                    "inputs": [item["name"] for item in contract["input"]],
+                    "expected": schema["expected"],
+                    "incident_id": schema["incident_id"],
+                }
+
+                jobs_path = brd_path.with_name(f"{brd_path.stem}_jobs.json")
+                done_file = jobs_path.with_name(f"done_{jobs_path.stem}.json")
+
+                # ----------------- Check for NEW jobs -----------------
+                has_new_jobs = False
+                new_jobs = []
+                total_jobs = 0
+
+                if jobs_path.exists():
+                    try:
+                        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+                        if isinstance(jobs, list) and jobs:
+                            total_jobs = len(jobs)
+                            id_field = jobs_schema["incident_id"]
+                            if not id_field:
+                                raise ValueError("schema has no incident_id field; cannot track processed jobs")
+                            done_ids = _read_done_ids(done_file)
+                            rejected_hashes = _read_rejected_hashes(done_file)
+                            new_jobs = []
+                            for rec in jobs:
+                                if _runtime_record_hash(rec) in rejected_hashes:
+                                    continue
+                                if isinstance(rec, dict) and id_field in rec and str(rec[id_field]) in done_ids:
+                                    continue
+                                new_jobs.append(rec)
+                            has_new_jobs = bool(new_jobs)
+
+                            if not has_new_jobs and last_jobs_state != "idle":
+                                module_logger.info("No actionable jobs for %s — all processed or rejected.", brd_path.name)
+                                last_jobs_state = "idle"
+                            elif has_new_jobs and last_jobs_state != "pending":
+                                module_logger.info("%d actionable job(s) for %s.",
+                                                   len(new_jobs), brd_path.name)
+                                if is_debug_mode:
+                                    module_logger.debug("First job preview: %s", json.dumps(new_jobs[0], ensure_ascii=False)[:800])
+                                last_jobs_state = "pending"
+                        else:
+                            if last_jobs_state != "idle":
+                                module_logger.info("No new jobs for %s — jobs file empty.", brd_path.name)
+                                last_jobs_state = "idle"
+                            has_new_jobs = False
+                    except Exception as exc:
+                        module_logger.error("Error checking jobs for %s: %s", brd_path.name, exc, exc_info=is_debug_mode)
+                        time.sleep(check_interval)
+                        continue
+                else:
+                    if last_jobs_state != "idle":
+                        module_logger.info("No jobs file for %s yet (%s).", brd_path.name, jobs_path.name)
+                        last_jobs_state = "idle"
+                    has_new_jobs = False
+
+                if not has_new_jobs:
+                    time.sleep(min(5.0, check_interval * 2))
+                    continue
+
+                # ----------------- Process jobs (if any) -----------------
+                try:
+                    ok_batch, reflection = process_jobs(
+                        cached_func, jobs_schema, jobs_path, done_file,
+                        output_contract=contract["output"],
+                        input_specs=contract["input"],
+                        compare_expected=True,
+                    )
+                except JobDataTemporarilyUnavailable as exc:
+                    module_logger.warning(
+                        "Skipping this polling cycle for %s: %s; will retry. "
+                        "Active function remains unchanged.", brd_path.name, exc,
+                    )
+                    time.sleep(check_interval)
+                    continue
+                if ok_batch:
+                    worker_logger.info("✅ Jobs processed for %s", brd_path.name)
+                    last_reflection = None
+                    last_activity_time = now
+                    time.sleep(check_interval)
+                else:
+                    # This is a failure of a valid live job, not malformed job data.
+                    # Stop immediately: never auto-repair a deployed function via GPT.
+                    worker_logger.error("❌ Live-job function failure for %s: %s", brd_path.name, reflection)
+                    try:
+                        if last_impl_meta and last_brd_hash == current_hash:
+                            add_quarantine(
+                                reg_path=registry_path,
+                                hash_signature=current_hash,
+                                script_name=last_impl_meta.get("script_name", "<unknown>"),
+                                origin=last_impl_meta.get("origin", "unknown"),
+                                reason=(reflection or "live-job function failure"),
+                                registry_lock=registry_lock,
+                                script_path=last_impl_meta.get("script_path"),
+                            )
+                    except Exception as q_exc:
+                        module_logger.error("Could not quarantine implementation: %s", q_exc)
+
+                    blocked_hash = current_hash
+                    blocked_reason = "Deployed function failed on a valid live job; human review required"
+                    next_block_warn_ts = 0.0
+                    last_reflection = None
+                    cached_func = None
+                    last_impl_meta = None
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
+                    try:
+                        block_brd_until_changed(
+                            registry_path, current_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="live_job_failure",
+                        )
+                    except Exception as exc:
+                        module_logger.error("Could not persist human-review block for %s: %s", brd_path.name, exc)
+                    module_logger.error(
+                        "ESCALATE TO HUMAN: BRD %s is blocked. "
+                        "No automatic GPT repair or subsequent real-job processing.",
+                        brd_path.name,
+                    )
+                    time.sleep(check_interval)
+
+
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                try: worker_logger.info("IPC channel gone (%s) — exiting %s.", type(exc).__name__, brd_path.name)
+                except Exception: pass
+                break
+            except KeyboardInterrupt:
+                worker_logger.info("KeyboardInterrupt — exiting %s", brd_path.name)
+                break
+            except Exception as exc:
+                if cached_func is not None and last_impl_meta and last_brd_hash:
+                    # A valid active implementation was running when the
+                    # unexpected loop exception occurred: fail closed for
+                    # human investigation, not automatic LLM regeneration.
+                    module_logger.exception(
+                        "ESCALATE TO HUMAN: unexpected active-function loop failure for %s: %s",
+                        brd_path.name, exc,
+                    )
+                    try:
+                        add_quarantine(
+                            reg_path=registry_path,
+                            hash_signature=last_brd_hash,
+                            script_name=last_impl_meta.get("script_name", "<unknown>"),
+                            origin=last_impl_meta.get("origin", "unknown"),
+                            reason=f"Unexpected active-function loop error: {type(exc).__name__}: {exc}",
+                            registry_lock=registry_lock,
+                            script_path=last_impl_meta.get("script_path"),
+                        )
+                    except Exception as quarantine_exc:
+                        module_logger.error("Quarantine failed: %s", quarantine_exc)
+                    blocked_hash = last_brd_hash
+                    blocked_reason = "Unexpected exception while active function was running; human review required"
+                    next_block_warn_ts = 0.0
+                    last_reflection = None
+                    cached_func = None
+                    last_impl_meta = None
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
+                    try:
+                        block_brd_until_changed(
+                            registry_path, blocked_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="active_function_loop_error",
+                        )
+                    except Exception as persist_exc:
+                        module_logger.error("Failed to persist active-function block: %s", persist_exc)
+                    time.sleep(check_interval)
+                    continue
+
+                module_logger.exception("Loop error for %s (will retry): %s", brd_path.name, exc)
+                cached_func = None
+                cached_contract = None
+                cached_brd_tests = None
+                cached_n_items_to_pass = None
+                cached_id_field = None
+                cached_expected_field = None
+                time.sleep(check_interval)
+
+    except Exception as exc:
+        module_logger.exception("Fatal error in perpetual processing for %s: %s", brd_path.name, exc)
+        raise
+    finally:
+        # No hanging/stale watchdog markers after a graceful shutdown.
+        _active_function_watchdog = None
+        try:
+            shared = shared_data["shared_dict"]
+            key = f"function_call::{brd_path.name}"
+            state = shared.get(key)
+            if isinstance(state, dict) and state.get("pid") == os.getpid():
+                shared.pop(key, None)
+        except Exception:
+            pass
+        # Final summary, then detach handler from all loggers and close once
+        try:
+            mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            runtime = time.time() - last_activity_time
+            worker_logger.info(
+                "Perpetual processing stopped for %s (Δt since last activity: %.1fs, RSS: %.1f MB)",
+                brd_path.name, runtime, mem_mb
+            )
+        except Exception:
+            pass
+        try:
+            import gc; gc.collect()
+        except Exception:
+            pass
+        for lg in (worker_logger, module_logger, tools_logger):
+            try: lg.removeHandler(qh)
+            except Exception: pass
+        try: qh.close()
+        except Exception: pass
+        try: logging.shutdown()
+        except Exception: pass
