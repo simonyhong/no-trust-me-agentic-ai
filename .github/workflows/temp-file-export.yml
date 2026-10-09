@@ -1,0 +1,14 @@
+name: Temporary file export
+on:
+  push:
+    branches: [temp-export-job-manager-20261009]
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: job_manager_exact_main
+          path: job_manager.py
+          retention-days: 1
