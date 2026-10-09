@@ -33,6 +33,8 @@ GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAI
 MAX_ATTEMPTS = 10
 # Maximum actionable records a BRD worker processes before yielding for fairness.
 MAX_JOBS_PER_WORKER_SESSION = max(1, int(os.getenv("MAX_JOBS_PER_WORKER_SESSION", "25")))
+# 0 disables the per-invocation GPT request count cap (not recommended).
+MAX_GPT_CALLS_PER_FUNCTION = max(0, int(os.getenv("MAX_GPT_CALLS_PER_FUNCTION", "5")))
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
 
@@ -1082,7 +1084,7 @@ def _classify_gpt_error(exc: BaseException) -> str:
 _temperature_unsupported = False
 
 
-def gpt_call_with_retry(semaphore, **kwargs):
+def gpt_call_with_retry(semaphore, *, on_slot_change=None, check_cancel=None, **kwargs):
     """Bound a GPT interaction separately from the generated-function watchdog.
 
     The API call has a per-attempt timeout, the semaphore wait is bounded,
@@ -1103,6 +1105,8 @@ def gpt_call_with_retry(semaphore, **kwargs):
     backoff = 1.0
     last_error = None
     for _ in range(_RETRY_STEPS):
+        if check_cancel is not None:
+            check_cancel()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -1112,6 +1116,10 @@ def gpt_call_with_retry(semaphore, **kwargs):
             last_error = TimeoutError("No free GPT concurrency slot within the configured wait")
             break
         try:
+            if on_slot_change is not None:
+                on_slot_change(True)
+            if check_cancel is not None:
+                check_cancel()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 last_error = TimeoutError("GPT tool timeout exceeded before API request")
@@ -1122,6 +1130,8 @@ def gpt_call_with_retry(semaphore, **kwargs):
                 timeout=per_request,
                 **call_kwargs,
             )
+        except FunctionExecutionLimitExceeded:
+            raise
         except (RateLimitError, APIStatusError) as exc:
             last_error = exc
             status = getattr(exc, "status_code", None)
@@ -1139,8 +1149,15 @@ def gpt_call_with_retry(semaphore, **kwargs):
             last_error = exc
             LOG.warning("GPT transport/timeout error (%s) - backing off", type(exc).__name__)
         finally:
-            semaphore.release()
+            # Even on errors and cancellations, always return this permit.
+            try:
+                semaphore.release()
+            finally:
+                if on_slot_change is not None:
+                    on_slot_change(False)
 
+        if check_cancel is not None:
+            check_cancel()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -1157,12 +1174,44 @@ def gpt_call_with_retry(semaphore, **kwargs):
 # A generated function cannot hide an outage by catching its exception and
 # returning a fabricated "successful" fallback answer.
 _gpt_tool_issue_during_call: tuple[str, str] | None = None
+_gpt_calls_in_monitored_call = 0
+_function_limit_issue_during_call: str | None = None
+
+
+class FunctionExecutionLimitExceeded(RuntimeError):
+    """A generated function exceeded its invocation-level call/time budget."""
 
 
 def _generated_ask_gpt(messages, temperature=0):
-    """Approved GPT wrapper; distinguish transient, invalid, and setup errors."""
-    global _gpt_tool_issue_during_call
+    """Approved GPT wrapper: enforce cost limits and honor parent cancellation."""
+    global _gpt_tool_issue_during_call, _gpt_calls_in_monitored_call
+    global _function_limit_issue_during_call
     mark, phase = _active_function_watchdog, _monitored_phase
+
+    def check_cancel():
+        global _function_limit_issue_during_call
+        reason = mark("check_cancel", phase) if mark is not None and phase is not None else None
+        if reason:
+            _function_limit_issue_during_call = str(reason)
+            raise FunctionExecutionLimitExceeded(str(reason))
+
+    def slot_change(held: bool):
+        if mark is not None and phase is not None:
+            mark("slot_acquired" if held else "slot_released", phase)
+
+    # Check before any remote request. The count is for one *function invocation*,
+    # not for code generation or the lifetime of this worker.
+    if phase is not None:
+        check_cancel()
+        _gpt_calls_in_monitored_call += 1
+        if MAX_GPT_CALLS_PER_FUNCTION and _gpt_calls_in_monitored_call > MAX_GPT_CALLS_PER_FUNCTION:
+            reason = (
+                f"Function attempted more than {MAX_GPT_CALLS_PER_FUNCTION} "
+                "GPT tool calls in one invocation"
+            )
+            _function_limit_issue_during_call = reason
+            raise FunctionExecutionLimitExceeded(reason)
+
     if mark is not None and phase is not None:
         mark("pause", phase)
     try:
@@ -1171,8 +1220,6 @@ def _generated_ask_gpt(messages, temperature=0):
                 raise GPTServiceConfigurationError(
                     "Generated-code GPT tool is unavailable outside an active BRD worker"
                 )
-            # Validate the wrapper contract before invoking the provider SDK.
-            # Avoid treating a malformed generated-code argument as a service outage.
             if not isinstance(messages, list) or not messages or not all(
                 isinstance(item, dict) and isinstance(item.get("role"), str)
                 and "content" in item for item in messages
@@ -1184,8 +1231,16 @@ def _generated_ask_gpt(messages, temperature=0):
             kwargs = {"messages": messages}
             if temperature is not None:
                 kwargs["temperature"] = temperature
-            response = gpt_call_with_retry(_active_gpt_semaphore, **kwargs)
+            response = gpt_call_with_retry(
+                _active_gpt_semaphore,
+                on_slot_change=slot_change if phase is not None else None,
+                check_cancel=check_cancel if phase is not None else None,
+                **kwargs,
+            )
+            check_cancel()  # Never accept a result after a parent cancellation.
             return response.choices[0].message.content
+        except FunctionExecutionLimitExceeded:
+            raise  # A function-limit breach is neither GPT outage nor configuration.
         except Exception as exc:
             classification = _classify_gpt_error(exc)
             detail = f"{type(exc).__name__}: {exc}"
@@ -1241,17 +1296,24 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
     Python waits for the code-generating GPT API.
     """
     global _monitored_phase, _gpt_tool_issue_during_call
+    global _gpt_calls_in_monitored_call, _function_limit_issue_during_call
     mark = _active_function_watchdog
     previous_phase = _monitored_phase
     previous_issue = _gpt_tool_issue_during_call
+    previous_count = _gpt_calls_in_monitored_call
+    previous_limit_issue = _function_limit_issue_during_call
     if mark is not None:
         mark("start", phase)
     _monitored_phase = phase
     _gpt_tool_issue_during_call = None
+    _gpt_calls_in_monitored_call = 0
+    _function_limit_issue_during_call = None
     try:
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
+            if _function_limit_issue_during_call:
+                raise FunctionExecutionLimitExceeded(_function_limit_issue_during_call) from exc
             # A generated function may have caught a tool error, then failed
             # for another reason. Preserve the true tool-failure classification.
             if _gpt_tool_issue_during_call is not None:
@@ -1261,6 +1323,12 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
                 if kind == "configuration":
                     raise GPTServiceConfigurationError(detail) from exc
             raise
+        if mark is not None:
+            cancelled = mark("check_cancel", phase)
+            if cancelled:
+                _function_limit_issue_during_call = str(cancelled)
+        if _function_limit_issue_during_call:
+            raise FunctionExecutionLimitExceeded(_function_limit_issue_during_call)
         if _gpt_tool_issue_during_call is not None:
             kind, detail = _gpt_tool_issue_during_call
             if kind == "transient":
@@ -1277,6 +1345,8 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
         return result
     finally:
         _gpt_tool_issue_during_call = previous_issue
+        _gpt_calls_in_monitored_call = previous_count
+        _function_limit_issue_during_call = previous_limit_issue
         _monitored_phase = previous_phase
         if mark is not None:
             mark("end", phase)
@@ -2012,14 +2082,24 @@ def process_single_brd_standalone(
                 shared[key] = {
                     "pid": os.getpid(),
                     "started_monotonic": now,
+                    "wall_started_monotonic": now,  # Does not pause for GPT calls.
                     "phase": phase,
                     "paused": False,
+                    "gpt_slot_held": False,
                 }
                 return
             state = shared.get(key)
             if not isinstance(state, dict) or state.get("pid") != os.getpid():
                 return
-            if event == "end":
+            if event == "check_cancel":
+                return state.get("cancel_reason") if state.get("cancel_requested") else None
+            if event == "slot_acquired":
+                state["gpt_slot_held"] = True
+                shared[key] = state
+            elif event == "slot_released":
+                state["gpt_slot_held"] = False
+                shared[key] = state
+            elif event == "end":
                 shared.pop(key, None)
             elif event == "pause" and not state.get("paused", False):
                 state["elapsed_compute"] = max(0.0, now - float(state["started_monotonic"]))
@@ -2032,6 +2112,7 @@ def process_single_brd_standalone(
                 shared[key] = state
         except (OSError, EOFError, BrokenPipeError):
             pass  # Manager loss is handled separately by the worker lifecycle.
+        return None
 
     _active_function_watchdog = _mark_function_call
     parent_pid = os.getppid()
