@@ -96,11 +96,19 @@ For each current BRD hash, the worker tries candidates in this order:
 
 Every candidate must pass the same Python-owned validation: all BRD-authored tests plus the first `N_ITEMS_TO_PASS` labeled jobs.
 
+## Blind real-job deployment gate
+
+The code-generation LLM may be shown detailed failures from **BRD-authored examples** and may retry up to `MAX_ATTEMPTS` times. The N labeled real jobs are an independent **blind deployment gate**: after a GPT-generated candidate passes BRD examples, Python evaluates it against those jobs. A failed N-job check immediately blocks that BRD hash and requests human review; it does **not** send real-job inputs, expected outputs, actual outputs, or failing-case feedback to GPT, and it does **not** trigger another GPT generation attempt. Human-visible logs may include failure details.
+
+Handcrafted and previously cached candidates are checked using the same BRD examples and N jobs. If such a candidate fails, Python may try the next candidate without supplying its N-job failure details to GPT. The GPT-generated candidate's first failed N-job validation is terminal for that BRD hash until the BRD changes.
+
 ## Runtime recovery behavior
 
 A normal BRD content change invalidates the active in-memory function, clears any previous reflection, reparses the BRD, reruns deployment preflight, and starts normal candidate selection again.
 
-A runtime batch failure is different. Runtime inputs are first validated against the BRD contract so malformed job data is rejected without blaming the function. If a valid job exposes a function failure, the implementation is quarantined, the failure reflection is retained, and the next recovery pass skips handcrafted/cache reuse once and goes directly to GPT generation with that reflection. After three consecutive live-batch failures for the same BRD hash, the worker enters blocked mode to stop unbounded regeneration.
+A runtime batch failure is different. Runtime inputs are first validated against the BRD contract so malformed job data is rejected without blaming the function. If a valid job exposes a function failure, the implementation is quarantined. The next recovery pass skips handcrafted/cache reuse once and may regenerate the function, but GPT receives **only a generic runtime-failure message**, not real-job inputs, expected values, or actual outputs. Detailed failure information remains in logs for humans. After three consecutive live-batch failures for the same BRD hash, the worker enters blocked mode.
+
+**Scope of blindness:** The code-**generating** LLM does not receive real-job test feedback. If a BRD deliberately requires an LLM-powered function (through `my_tools.ask_gpt`), that runtime LLM may still receive individual job inputs to perform its authorized task; it is not provided the expected test answers by the validator.
 
 ## Setup
 

@@ -1178,6 +1178,14 @@ def _check_manager_heartbeat_shared(shared_data, max_age: float = 15.0):
     except Exception as exc:
         return False, f"error:{type(exc).__name__}"
         
+class BlindDeploymentValidationFailure(RuntimeError):
+    """A generated candidate failed the blind N-job gate.
+
+    Keep this exception's message free of real-job inputs and expected answers:
+    it is for control flow / human escalation, never for GPT reflection.
+    """
+
+
 def _get_or_create_function(
     brd_path: pathlib.Path,
     brd_text: str,
@@ -1391,12 +1399,21 @@ def _get_or_create_function(
             func, jobs_schema, deployment_jobs, contract["output"]
         )
         if not ok_deploy:
-            logger.warning(
-                "Attempt %d failed one of the first %d labeled deployment jobs; retrying with reflection",
+            # BLIND HOLDOUT: the Python validator may log the failure for a human,
+            # but MUST NOT pass reflection2 (inputs/expected/actual) to GPT.
+            # Unlike BRD-authored example failures, a failed real-job test does
+            # not trigger another generation attempt for this BRD hash.
+            logger.error(
+                "Blind deployment gate failed after BRD examples passed "
+                "(attempt %d, N_ITEMS_TO_PASS=%d). "
+                "Rejecting candidate and escalating to a human; no real-job feedback to GPT.",
                 attempt, n_items_to_pass,
             )
-            local_reflection = reflection2
-            continue
+            raise BlindDeploymentValidationFailure(
+                f"Generated candidate failed blind validation on the first "
+                f"{n_items_to_pass} labeled real jobs. Human review required; "
+                "no real-job data was sent to the code-generating LLM."
+            )
 
         logger.info(
             "✅ Success on attempt %d after BRD tests + %d labeled deployment job(s)!",
@@ -1845,23 +1862,37 @@ def process_single_brd_standalone(
                         time.sleep(min(5.0, check_interval * 2))
                         continue
 
-                    func, func_name, impl_meta = _get_or_create_function(
-                        brd_path=brd_path,
-                        brd_text=brd_text,
-                        hash_signature=current_hash,
-                        schema=schema,
-                        contract=contract,
-                        brd_tests=brd_tests,
-                        n_items_to_pass=n_items_to_pass,
-                        deployment_jobs=deployment_jobs,
-                        saved_func_dir=saved_func_dir,
-                        registry_path=registry_path,
-                        gpt_semaphore=gpt_semaphore,
-                        registry_lock=registry_lock,
-                        logger=module_logger,
-                        is_debug_mode=is_debug_mode,
-                        reflection=last_reflection,
-                    )
+                    try:
+                        func, func_name, impl_meta = _get_or_create_function(
+                            brd_path=brd_path,
+                            brd_text=brd_text,
+                            hash_signature=current_hash,
+                            schema=schema,
+                            contract=contract,
+                            brd_tests=brd_tests,
+                            n_items_to_pass=n_items_to_pass,
+                            deployment_jobs=deployment_jobs,
+                            saved_func_dir=saved_func_dir,
+                            registry_path=registry_path,
+                            gpt_semaphore=gpt_semaphore,
+                            registry_lock=registry_lock,
+                            logger=module_logger,
+                            is_debug_mode=is_debug_mode,
+                            reflection=last_reflection,
+                        )
+                    except BlindDeploymentValidationFailure as exc:
+                        # Do not retry, regenerate, or send any blind-test data to GPT.
+                        blocked_hash = current_hash
+                        blocked_reason = str(exc)
+                        next_block_warn_ts = 0.0
+                        last_reflection = None
+                        module_logger.error(
+                            "Blind deployment validation stopped %s: %s "
+                            "Waiting for human BRD review/change.",
+                            brd_path.name, exc,
+                        )
+                        time.sleep(check_interval)
+                        continue
                     if func is None:
                         # Enter blocked mode for this BRD hash
                         blocked_hash = current_hash
@@ -1973,7 +2004,14 @@ def process_single_brd_standalone(
                     except Exception as q_exc:
                         module_logger.warning("Failed to quarantine impl: %s", q_exc)
 
-                    last_reflection = reflection
+                    # Never send real-job inputs, expected values, or actual outputs
+                    # back to the code-generating LLM. The human-facing details
+                    # remain in logs and quarantine metadata for investigation.
+                    last_reflection = (
+                        "A previously deployed implementation failed during real-job execution. "
+                        "Real-job details are withheld. Reimplement strictly from the "
+                        "BRD and its author-supplied examples; do not infer unseen jobs."
+                    )
                     cached_func = None
                     last_impl_meta = None
                     batch_fail_count += 1
