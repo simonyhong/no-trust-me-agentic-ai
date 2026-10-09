@@ -102,11 +102,19 @@ The code-generation LLM may be shown detailed failures from **BRD-authored examp
 
 Handcrafted and previously cached candidates are checked using the same BRD examples and N jobs. If such a candidate fails, Python may try the next candidate without supplying its N-job failure details to GPT. The GPT-generated candidate's first failed N-job validation is terminal for that BRD hash until the BRD changes.
 
-## Runtime recovery behavior
+## Runtime failure and human escalation
 
-A normal BRD content change invalidates the active in-memory function, clears any previous reflection, reparses the BRD, reruns deployment preflight, and starts normal candidate selection again.
+A normal BRD content change invalidates the active in-memory function, clears previous reflections, reparses the BRD, and reruns normal candidate selection and validation.
 
-A runtime batch failure is different. Runtime inputs are first validated against the BRD contract so malformed job data is rejected without blaming the function. If a valid job exposes a function failure, the implementation is quarantined. The next recovery pass skips handcrafted/cache reuse once and may regenerate the function, but GPT receives **only a generic runtime-failure message**, not real-job inputs, expected values, or actual outputs. Detailed failure information remains in logs for humans. After three consecutive live-batch failures for the same BRD hash, the worker enters blocked mode.
+**Malformed job records** are rejected and recorded in done-state without blaming the function.
+
+**A failure on a valid live job** (exception, wrong labeled answer, or BRD output-contract violation) now causes immediate quarantine of the active function and a persistent human-review block for that exact BRD hash. The worker stops processing that BRD and **does not ask GPT to regenerate a replacement**. The detailed failure remains in the logs for investigation; other BRDs continue operating.
+
+**An unexpected worker-process exit** is detected by `JobManager`. The manager conservatively blocks the last launched BRD hash and quarantines its last reported active function when one is known. A nonzero worker exit is not necessarily caused by the generated function; it still needs human diagnosis. Intentional stop requests and deleted BRDs do not trigger this block.
+
+Human-review blocks are stored in `saved_functions/registry.json` under `runtime_block`, so restarting the manager does not silently allow another attempt for the same BRD content. After investigating, edit the BRD to create a new hash (which triggers fresh validation), or explicitly clear the current hash's `runtime_block` in the registry while the manager is stopped after approving an alternative implementation. Editing only the generated/handcrafted Python file does not clear the persistent block.
+
+**Current limitation:** An infinite loop or a process stuck inside a generated function cannot be stopped reliably by the existing job timeout logic; separate sandbox execution with enforced timeouts is a future improvement.
 
 **Scope of blindness:** The code-**generating** LLM does not receive real-job test feedback. If a BRD deliberately requires an LLM-powered function (through `my_tools.ask_gpt`), that runtime LLM may still receive individual job inputs to perform its authorized task; it is not provided the expected test answers by the validator.
 
