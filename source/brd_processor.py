@@ -11,7 +11,7 @@ import random
 import multiprocessing
 import queue
 import openai
-from openai import APIConnectionError, APIStatusError, RateLimitError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 from typing import Callable, Any, List, Set, Tuple, Dict, Optional
@@ -21,6 +21,10 @@ import ast
 import logging, sys
 
 _RETRY_STEPS = 6
+# Limits for GPT as an external service; independent of function-compute watchdog.
+GPT_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_TOOL_TIMEOUT_SECONDS", "180")))
+GPT_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_REQUEST_TIMEOUT_SECONDS", "60")))
+GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS", "60")))
 MAX_ATTEMPTS = 10
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
@@ -41,6 +45,7 @@ if AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT:
         api_key=AZURE_OPENAI_API_KEY,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         api_version=AZURE_OPENAI_API_VERSION,
+        max_retries=0,  # all backoff is handled by gpt_call_with_retry
     )
 
 _active_gpt_semaphore = None
@@ -743,6 +748,8 @@ def run_deployment_validation_jobs(
 
         try:
             result = _invoke_monitored(func, *params, phase="deployment_validation")
+        except ExternalGPTUnavailable:
+            raise
         except Exception as exc:
             reflection = (
                 f"Function crashed on deployment-validation job #{ordinal} "
@@ -803,6 +810,8 @@ def run_brd_tests(
     for args, expected, test_index in tests:
         try:
             got = _invoke_monitored(func, *args, phase="brd_example")
+        except ExternalGPTUnavailable:
+            raise
         except Exception as exc:
             feedback.append(f"BRD test #{test_index}: args={args!r} -> raised {type(exc).__name__}: {exc}")
             ok = False
@@ -930,6 +939,12 @@ _temperature_unsupported = False
 
 
 def gpt_call_with_retry(semaphore, **kwargs):
+    """Bound a GPT interaction separately from the generated-function watchdog.
+
+    The API call has a per-attempt timeout, the semaphore wait is bounded,
+    and the total request/retry budget is bounded. The semaphore is held
+    ONLY for an API attempt, never during backoff or waiting for a slot.
+    """
     global _temperature_unsupported
     if gpt_client is None or not my_tools.gpt_model:
         raise RuntimeError(
@@ -940,13 +955,31 @@ def gpt_call_with_retry(semaphore, **kwargs):
     call_kwargs = dict(kwargs)
     if _temperature_unsupported:
         call_kwargs.pop("temperature", None)
-
+    deadline = time.monotonic() + GPT_TOOL_TIMEOUT_SECONDS
     backoff = 1.0
+    last_error = None
     for _ in range(_RETRY_STEPS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait = min(GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS, remaining)
+        acquired = semaphore.acquire(timeout=wait)
+        if not acquired:
+            last_error = TimeoutError("No free GPT concurrency slot within the configured wait")
+            break
         try:
-            with semaphore:
-                return gpt_client.chat.completions.create(model=my_tools.gpt_model, **call_kwargs)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = TimeoutError("GPT tool timeout exceeded before API request")
+                break
+            per_request = min(GPT_REQUEST_TIMEOUT_SECONDS, remaining)
+            return gpt_client.chat.completions.create(
+                model=my_tools.gpt_model,
+                timeout=per_request,
+                **call_kwargs,
+            )
         except (RateLimitError, APIStatusError) as exc:
+            last_error = exc
             status = getattr(exc, "status_code", None)
             message = str(exc).lower()
             if status == 400 and "temperature" in call_kwargs and "temperature" in message:
@@ -958,26 +991,51 @@ def gpt_call_with_retry(semaphore, **kwargs):
                 LOG.exception("GPT hard error")
                 raise
             LOG.warning("GPT 429 - backing off")
-        except APIConnectionError as exc:
-            LOG.warning("GPT connection error (%s) - backing off", type(exc).__name__)
+        except (APIConnectionError, APITimeoutError) as exc:
+            last_error = exc
+            LOG.warning("GPT transport/timeout error (%s) - backing off", type(exc).__name__)
+        finally:
+            semaphore.release()
 
-        sleep = backoff + random.uniform(0, 0.3)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sleep = min(backoff + random.uniform(0, 0.3), remaining)
         LOG.warning("GPT retry in %.1fs", sleep)
         time.sleep(sleep)
         backoff = min(backoff * 2, 60)
-    raise RuntimeError("GPT call failed after retries")
+    raise TimeoutError(
+        f"GPT service unavailable within {GPT_TOOL_TIMEOUT_SECONDS:g}s or {_RETRY_STEPS} retries"
+    ) from last_error
+
+
+class ExternalGPTUnavailable(RuntimeError):
+    """Transient external GPT/tool failure, not evidence of defective function code."""
 
 
 
 def _generated_ask_gpt(messages, temperature=0):
-    """Narrow LLM wrapper exposed to generated functions; returns message text only."""
+    """Approved GPT wrapper: exclude external-service waits from compute budget."""
     if _active_gpt_semaphore is None:
-        raise RuntimeError("Generated-code GPT tool is unavailable outside an active BRD worker")
+        raise ExternalGPTUnavailable("Generated-code GPT tool is unavailable outside an active BRD worker")
     kwargs = {"messages": messages}
     if temperature is not None:
         kwargs["temperature"] = temperature
-    resp = gpt_call_with_retry(_active_gpt_semaphore, **kwargs)
-    return resp.choices[0].message.content
+
+    mark, phase = _active_function_watchdog, _monitored_phase
+    if mark is not None and phase is not None:
+        mark("pause", phase)
+    try:
+        try:
+            response = gpt_call_with_retry(_active_gpt_semaphore, **kwargs)
+            return response.choices[0].message.content
+        except Exception as exc:
+            # The failure occurred in the approved external tool, not in
+            # the user-authored/generated function implementation itself.
+            raise ExternalGPTUnavailable(f"GPT service/tool error: {type(exc).__name__}: {exc}") from exc
+    finally:
+        if mark is not None and phase is not None:
+            mark("resume", phase)
 
 
 toolbox.ask_gpt = _generated_ask_gpt
@@ -1017,17 +1075,22 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
     may kill this worker while code runs. It is intentionally *not* set while
     Python waits for the code-generating GPT API.
     """
+    global _monitored_phase
     mark = _active_function_watchdog
+    previous_phase = _monitored_phase
     if mark is not None:
         mark("start", phase)
+    _monitored_phase = phase
     try:
         return func(*args, **kwargs)
     finally:
+        _monitored_phase = previous_phase
         if mark is not None:
             mark("end", phase)
 
 
 _active_function_watchdog = None
+_monitored_phase = None
 
 
 def process_jobs(
@@ -1193,6 +1256,9 @@ def process_jobs(
                 _persist_done()
                 unsaved = 0
 
+        except ExternalGPTUnavailable:
+            _persist_done()
+            raise
         except Exception as exc:
             try:
                 record_json = json.dumps(rec, ensure_ascii=False)
@@ -1334,6 +1400,8 @@ def _get_or_create_function(
                     logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.warning("Handcrafted impl failed BRD-authored tests/contract")
+        except ExternalGPTUnavailable:
+            raise
         except Exception as exc:
             logger.warning("Handcrafted load/test failed: %s", exc)
     elif handcrafted.exists() and skip_reuse_once:
@@ -1381,6 +1449,8 @@ def _get_or_create_function(
                     logger.info("Cached impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.info("Cache invalid – BRD-authored tests/contract failed")
+        except ExternalGPTUnavailable:
+            raise
         except Exception as exc:
             logger.warning("Cache load/test failed: %s", exc)
     elif latest_script and skip_reuse_once:
@@ -1413,9 +1483,11 @@ def _get_or_create_function(
             if is_debug_mode:
                 logger.info("GPT response:\n%s", resp)
         except Exception as exc:
-            local_reflection = f"GPT call failed with error: {type(exc).__name__}: {exc}"
-            logger.warning("Attempt %d failed at GPT call: %s", attempt, exc)
-            continue
+            # The generator API failed before candidate code could be evaluated.
+            # Do not consume code-repair attempts or block a BRD due to service outage.
+            raise ExternalGPTUnavailable(
+                f"GPT code-generation service unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
 
         try:
             code = clean_generated_code(resp)
@@ -1445,6 +1517,8 @@ def _get_or_create_function(
             if not callable(func):
                 raise ValueError(f"Function {expected_function_name} not found or not callable")
             logger.info("Code compilation successful - function %s loaded", expected_function_name)
+        except ExternalGPTUnavailable:
+            raise
         except Exception as exc:
             local_reflection = f"Your code did not compile:\n{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}"
             logger.warning("Attempt %d failed at compilation: %s", attempt, exc)
@@ -1706,21 +1780,35 @@ def process_single_brd_standalone(
     # ---------- runtime state ----------
     # Each spawned BRD worker owns its own monitoring callback. Only an active
     # function call is timed; regular polling and GPT code generation are not.
-    global _active_function_watchdog
+    global _active_function_watchdog, _monitored_phase
     def _mark_function_call(event: str, phase: str) -> None:
+        """Track cumulative computation time; pause only approved GPT-tool waits."""
         key = f"function_call::{brd_path.name}"
         try:
             shared = shared_data["shared_dict"]
+            now = time.monotonic()
             if event == "start":
                 shared[key] = {
                     "pid": os.getpid(),
-                    "started_monotonic": time.monotonic(),
+                    "started_monotonic": now,
                     "phase": phase,
+                    "paused": False,
                 }
-            else:
-                state = shared.get(key)
-                if isinstance(state, dict) and state.get("pid") == os.getpid():
-                    shared.pop(key, None)
+                return
+            state = shared.get(key)
+            if not isinstance(state, dict) or state.get("pid") != os.getpid():
+                return
+            if event == "end":
+                shared.pop(key, None)
+            elif event == "pause" and not state.get("paused", False):
+                state["elapsed_compute"] = max(0.0, now - float(state["started_monotonic"]))
+                state["paused"] = True
+                shared[key] = state
+            elif event == "resume" and state.get("paused", False):
+                elapsed = float(state.pop("elapsed_compute", 0.0))
+                state["started_monotonic"] = now - elapsed
+                state["paused"] = False
+                shared[key] = state
         except (OSError, EOFError, BrokenPipeError):
             pass  # Manager loss is handled separately by the worker lifecycle.
 
@@ -2144,6 +2232,14 @@ def process_single_brd_standalone(
                     time.sleep(check_interval)
 
 
+            except ExternalGPTUnavailable as exc:
+                module_logger.warning(
+                    "External GPT service unavailable for %s (%s). "
+                    "Will retry without quarantining or blocking the active function.",
+                    brd_path.name, exc,
+                )
+                time.sleep(check_interval)
+                continue
             except (BrokenPipeError, EOFError, OSError) as exc:
                 try: worker_logger.info("IPC channel gone (%s) — exiting %s.", type(exc).__name__, brd_path.name)
                 except Exception: pass
@@ -2207,6 +2303,7 @@ def process_single_brd_standalone(
     finally:
         # No hanging/stale watchdog markers after a graceful shutdown.
         _active_function_watchdog = None
+        _monitored_phase = None
         try:
             shared = shared_data["shared_dict"]
             key = f"function_call::{brd_path.name}"
