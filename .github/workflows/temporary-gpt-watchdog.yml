@@ -27,7 +27,7 @@ jobs:
           assert bp.GPT_TOOL_TIMEOUT_SECONDS > 0
           assert bp.GPT_REQUEST_TIMEOUT_SECONDS > 0
 
-          module=ast.parse(pathlib.Path(bp.__file__).read_text())
+          module=ast.parse(pathlib.Path(bp.__file__).read_text(encoding="utf-8"))
           worker=next(n for n in module.body if isinstance(n,ast.FunctionDef) and n.name=="process_single_brd_standalone")
           mark=next(n for n in ast.walk(worker) if isinstance(n,ast.FunctionDef) and n.name=="_mark_function_call")
           one=ast.Module(body=[mark],type_ignores=[])
