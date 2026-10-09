@@ -147,18 +147,17 @@ python job_manager.py
 
 The manager scans `documents/BRD_*.txt`, launches one worker per BRD up to the concurrency cap, and processes jobs from the matching JSON file.
 
-Runtime state and local demonstration outputs are written to files such as:
+Runtime state is written to files such as:
 
 ```text
 documents/done_BRD_word_count_jobs.json
-documents/results_BRD_word_count_jobs.json
 saved_functions/registry.json
 saved_functions/BRD_word_count/
 ```
 
-The results file persists successfully processed job outputs. Runtime state is flushed in bounded batches, with results written before done-state, so a crash can cause a small amount of safe re-processing but should not mark a successful job done before its output has been persisted.
+**Job answers are logged only.** The manager no longer writes `results_BRD_*_jobs.json` output files, and on startup it deletes obsolete results files left by earlier versions. If you need historical job answers, retain the logs or send outputs to an external destination before relying on this mode. Output values are not recoverable from the `done_*.json` state.
 
-Malformed runtime records are recorded under `rejected` in the matching `done_*.json` file using a hash of the record contents. If that record is corrected later, its hash changes and the corrected job becomes eligible again. These runtime-generated files are intentionally ignored by Git.
+The `done_*.json` file tracks processed job IDs and rejected-record hashes. The worker flushes state after bounded batches of 50 successful jobs and on batch completion or failure; a crash may cause a small amount of reprocessing since the last flush. Malformed runtime records are recorded under `rejected` using a hash of their content; correcting a record changes its hash and makes it eligible again. These runtime-generated files are intentionally ignored by Git.
 
 ## Resetting done-state during debugging
 
