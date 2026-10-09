@@ -857,10 +857,18 @@ def load_registry(reg_path: pathlib.Path) -> dict:
         return {}
 
 def get_brd_runtime_block(reg_path: pathlib.Path, hash_signature: str) -> dict | None:
-    """Return the persistent, BRD-hash-scoped human-review block, if any."""
+    """Return only BRD/function-related persistent blocks.
+
+    Earlier versions mistakenly persisted GPT configuration errors by BRD hash.
+    Ignore those legacy blocks: fixing shared credentials/deployment settings and
+    restarting must not require editing every unrelated BRD. The old metadata is
+    left in the registry for audit, not treated as an active block.
+    """
     entry = load_registry(reg_path).get(hash_signature, {})
     block = entry.get("runtime_block") if isinstance(entry, dict) else None
-    return block if isinstance(block, dict) else None
+    if not isinstance(block, dict) or block.get("origin") == "gpt_service_configuration":
+        return None
+    return block
 
 
 def block_brd_until_changed(
@@ -878,7 +886,10 @@ def block_brd_until_changed(
         entry = registry.setdefault(hash_signature, {})
         entry.setdefault("title", brd_filename)
         entry.setdefault("folder_name", pathlib.Path(brd_filename).stem)
-        if "runtime_block" not in entry:
+        existing_block = entry.get("runtime_block")
+        if not isinstance(existing_block, dict) or existing_block.get("origin") == "gpt_service_configuration":
+            # Replace any obsolete configuration-only block with a real BRD or
+            # function failure. Otherwise the old entry would mask the new block.
             entry["runtime_block"] = {
                 "reason": str(reason)[:500],
                 "origin": origin,
@@ -2337,16 +2348,17 @@ def process_single_brd_standalone(
 
 
             except GPTServiceConfigurationError as exc:
-                # Service credentials, deployment name or provider policy are
-                # external configuration issues, not function defects.
+                # Shared GPT configuration/policy failures are not BRD defects.
+                # Keep the worker blocked in memory until restart (after an operator
+                # repairs the environment or provider configuration). Never persist
+                # a per-BRD hash block for a global GPT service misconfiguration.
                 blocked_hash = current_hash
-                blocked_reason = f"GPT configuration/policy failure; human review required: {str(exc)[:250]}"
+                blocked_reason = (
+                    "GPT configuration/policy failure; fix the service settings "
+                    f"and restart: {str(exc)[:250]}"
+                )
                 next_block_warn_ts = 0.0
                 last_reflection = None
-                block_brd_until_changed(
-                    registry_path, current_hash, brd_path.name, blocked_reason,
-                    registry_lock=registry_lock, origin="gpt_service_configuration",
-                )
                 module_logger.error("ESCALATE TO HUMAN: %s", blocked_reason)
                 time.sleep(check_interval)
                 continue
