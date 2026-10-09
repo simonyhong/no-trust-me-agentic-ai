@@ -21,9 +21,13 @@ SAVED_FUNC_DIR = PROJECT_ROOT / "saved_functions"
 REGISTRY = SAVED_FUNC_DIR / "registry.json"
 MAX_RECORD_BYTES = 64_000     # 64 KB cap per log record
 RESET_DONE_STATE = os.getenv("RESET_DONE_STATE", "0").strip().lower() in {"1", "true", "yes", "on"}
-# Wall-clock limit for each generated-function invocation. Set to 0 to disable.
+# Cumulative non-GPT computation limit per function call. Set to 0 to disable.
 # This watchdog limits accidental hangs; it is not a security sandbox.
 FUNCTION_CALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_CALL_TIMEOUT_SECONDS", "120"))
+# Total time per function invocation, INCLUDING GPT waits. Set to 0 to disable.
+FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS", "300"))
+# Give a cancelled invocation an opportunity to finish without leaking a GPT slot.
+FUNCTION_CANCELLATION_GRACE_SECONDS = max(0.0, float(os.getenv("FUNCTION_CANCELLATION_GRACE_SECONDS", "3")))
 
 ##################################### Job Manager ###################################################
 SEMAPHORE_LIMIT = 5 # Only 5 concurrent GPT calls allowed 
@@ -540,9 +544,16 @@ class JobManager:
             pass
 
     def _check_function_timeouts(self) -> None:
-        """Terminate timed-out worker functions; cleanup subsequently blocks BRD."""
-        timeout = FUNCTION_CALL_TIMEOUT_SECONDS
-        if timeout <= 0:
+        """Enforce cumulative computation AND total invocation wall-time limits.
+
+        Request cancellation first. A generated GPT wrapper observes the request
+        before subsequent calls and after a current API response. Kill a stuck
+        worker after a bounded grace period, waiting longer if it currently holds
+        a GPT slot to reduce the chance of stranding a shared semaphore permit.
+        """
+        compute_limit = FUNCTION_CALL_TIMEOUT_SECONDS
+        wall_limit = FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS
+        if compute_limit <= 0 and wall_limit <= 0:
             return
         try:
             shared = self.shared_data["shared_dict"]
@@ -550,31 +561,77 @@ class JobManager:
             return
         now = time.monotonic()
         for proc in list(self.active_processes):
-            if not proc.is_alive() or proc.pid in self._timed_out_pids:
+            if not proc.is_alive():
                 continue
             brd = self._pid_to_brd.get(proc.pid)
             if brd is None:
                 continue
             try:
-                state = shared.get(f"function_call::{brd.name}")
+                key = f"function_call::{brd.name}"
+                state = shared.get(key)
                 if not isinstance(state, dict) or state.get("pid") != proc.pid:
                     continue
-                if state.get("paused", False):
-                    # Approved GPT/tool I/O is excluded from the computation budget;
-                    # the parent enforces its separate tool-call deadline.
+                paused = bool(state.get("paused", False))
+                compute_elapsed = now - float(state.get("started_monotonic", now))
+                wall_elapsed = now - float(
+                    state.get("wall_started_monotonic", state.get("started_monotonic", now))
+                )
+                exceeded = (
+                    (compute_limit > 0 and not paused and compute_elapsed > compute_limit)
+                    or (wall_limit > 0 and wall_elapsed > wall_limit)
+                )
+                failure = self._timed_out_pids.get(proc.pid)
+                if failure is None:
+                    if not exceeded:
+                        continue
+                    kind = "total_wall" if wall_limit > 0 and wall_elapsed > wall_limit else "computation"
+                    elapsed = wall_elapsed if kind == "total_wall" else compute_elapsed
+                    limit = wall_limit if kind == "total_wall" else compute_limit
+                    reason = (
+                        f"Function exceeded {kind} budget: {elapsed:.1f}s elapsed "
+                        f"(limit {limit:.1f}s, phase={state.get('phase', 'function_call')})"
+                    )
+                    failure = {
+                        "phase": str(state.get("phase", "function_call")),
+                        "elapsed": elapsed, "limit": limit,
+                        "kind": kind, "reason": reason, "requested_at": now,
+                    }
+                    self._timed_out_pids[proc.pid] = failure
+                    state["cancel_requested"] = True
+                    state["cancel_reason"] = reason
+                    shared[key] = state
+                    self.logger.error(
+                        "ESCALATE TO HUMAN: BRD %s worker %s %s. "
+                        "Requesting cooperative cancellation.", brd.name, proc.pid, reason,
+                    )
                     continue
-                started = float(state.get("started_monotonic", now))
-                elapsed = now - started
-                if elapsed <= timeout:
+
+                # A worker pause/resume marker update could race with our first
+                # cancellation write. Reassert the request on subsequent ticks.
+                if not state.get("cancel_requested", False):
+                    state["cancel_requested"] = True
+                    state["cancel_reason"] = failure.get("reason", "Function execution budget exceeded")
+                    shared[key] = state
+
+                # The worker has been told to stop. Once it returns from a GPT
+                # call it can release the semaphore before honoring cancellation.
+                elapsed_since_cancel = now - float(failure.get("requested_at", now))
+                wait_grace = FUNCTION_CANCELLATION_GRACE_SECONDS
+                if state.get("gpt_slot_held", False):
+                    # An HTTP request can take up to the configured per-request
+                    # deadline. Force kill only after a bounded opportunity to
+                    # release the GPT semaphore. This is best effort, not a broker.
+                    wait_grace = max(
+                        wait_grace,
+                        brd_processor.GPT_REQUEST_TIMEOUT_SECONDS + 5.0,
+                    )
+                if elapsed_since_cancel < wait_grace:
                     continue
-                phase = str(state.get("phase", "function_call"))
-                self._timed_out_pids[proc.pid] = {
-                    "phase": phase, "elapsed": elapsed, "limit": timeout,
-                }
                 self.logger.error(
-                    "ESCALATE TO HUMAN: function call in BRD %s (%s) exceeded "
-                    "%.1fs timeout (elapsed %.1fs); terminating worker PID %s.",
-                    brd.name, phase, timeout, elapsed, proc.pid,
+                    "ESCALATE TO HUMAN: BRD %s did not honor cancellation after %.1fs; "
+                    "force-terminating PID %s (GPT slot held=%s).",
+                    brd.name, elapsed_since_cancel, proc.pid,
+                    bool(state.get("gpt_slot_held", False)),
                 )
                 proc.terminate()
                 proc.join(timeout=2)
@@ -681,10 +738,7 @@ class JobManager:
                                     successful=False, registry_lock=self.shared_data.get("lock"),
                                 )
                             reason = (
-                                "Function call timed out after "
-                                f"{watchdog_failure['elapsed']:.1f}s "
-                                f"(limit {watchdog_failure['limit']:.1f}s; "
-                                f"phase={watchdog_failure['phase']})"
+                                watchdog_failure.get("reason", "Function execution limit exceeded")
                                 if watchdog_failure is not None
                                 else f"Unexpected worker process exit (code={exit_code})"
                             )
