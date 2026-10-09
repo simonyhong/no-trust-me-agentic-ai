@@ -38,6 +38,11 @@ class JobManager:
         self._pid_to_log: dict[int, tuple] = {}
         self._timed_out_pids: dict[int, dict] = {}
         self._blocked_log_ts: dict[str, float] = {}
+        # Idle/waiting workers release their process slots. Re-launch only if
+        # relevant input files change, or after a bounded service-retry delay.
+        self._snoozed_fingerprints: dict[str, tuple] = {}
+        self._retry_after: dict[str, float] = {}
+        self._session_blocks: set[str] = set()  # GPT configuration issues until manager restart
         self.active_processes = []
         self.gpt_semaphore = multiprocessing.BoundedSemaphore(SEMAPHORE_LIMIT)
 
@@ -279,6 +284,46 @@ class JobManager:
         # Handcrafted folders contain user-written source. Never delete them automatically.
 
     ########################   RUN LOOP   ########################################
+    @staticmethod
+    def _work_fingerprint(brd: pathlib.Path) -> tuple:
+        """Lightweight change detector; no expensive whole-jobs JSON scan per poll."""
+        jobs = brd.with_name(f"{brd.stem}_jobs.json")
+        done = brd.with_name(f"done_{jobs.stem}.json")
+        def stamp(path):
+            try:
+                stat = path.stat()
+                return (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                return None
+        return (stamp(brd), stamp(jobs), stamp(done))
+
+    def _consider_worker_yield(self, brd: pathlib.Path, proc_pid: int) -> None:
+        """Capture clean worker yield before freeing its concurrency slot."""
+        reason = None
+        try:
+            shared = self.shared_data.get("shared_dict")
+            value = shared.get(f"worker_yield::{brd.name}") if shared is not None else None
+            if isinstance(value, dict) and value.get("pid") == proc_pid:
+                reason = value.get("reason")
+                shared.pop(f"worker_yield::{brd.name}", None)
+        except (OSError, EOFError, BrokenPipeError):
+            pass
+        self._snoozed_fingerprints[brd.name] = self._work_fingerprint(brd)
+        if reason == "blocked_configuration":
+            self._session_blocks.add(brd.name)
+        elif reason == "service_retry":
+            self._retry_after[brd.name] = time.monotonic() + 45.0
+        elif reason == "quantum":
+            # Yield behind queued BRDs rather than immediately monopolizing a slot.
+            self._retry_after[brd.name] = time.monotonic() + 5.0
+        elif reason is None:
+            # Unexpected clean exit without a yield marker: prevent rapid respawn.
+            self._retry_after[brd.name] = time.monotonic() + 15.0
+        else:
+            self._retry_after.pop(brd.name, None)
+        if reason:
+            self.logger.info("BRD %s released worker slot (%s)", brd.name, reason)
+
     def run_continuous(self, check_interval: int = 1, only_list=None, exclude_list=None):
         self.logger.info("Starting with max %d concurrent jobs. Checking every %ds", self.max_concurrent_BRD_agents, check_interval)
 
@@ -315,6 +360,8 @@ class JobManager:
                     for brd in brd_files:
                         if brd in self._inflight_brds:
                             continue
+                        if brd.name in self._session_blocks:
+                            continue  # operator fixes service config and restarts manager
 
                         # A block is tied to the exact BRD content hash, and persists
                         # across JobManager restarts. A human BRD edit yields a new hash.
@@ -326,7 +373,10 @@ class JobManager:
                         except (OSError, UnicodeError) as exc:
                             self.logger.warning("Cannot inspect BRD %s: %s", brd.name, exc)
                             continue
-                        if block:
+                        approval = brd_processor.get_approved_handcrafted_recovery(
+                            REGISTRY, launch_hash, SAVED_FUNC_DIR, brd
+                        ) if block else None
+                        if block and not approval:
                             key = f"{brd.name}:{launch_hash}"
                             if current_time - self._blocked_log_ts.get(key, 0) >= 30:
                                 self.logger.error(
@@ -335,17 +385,28 @@ class JobManager:
                                 )
                                 self._blocked_log_ts[key] = current_time
                             continue
+                        if not approval:
+                            snap = self._work_fingerprint(brd)
+                            unchanged = self._snoozed_fingerprints.get(brd.name) == snap
+                            retry_time = self._retry_after.get(brd.name)
+                            if retry_time is not None and time.monotonic() < retry_time:
+                                continue
+                            if unchanged and retry_time is None:
+                                continue
+                            if retry_time is not None:
+                                self._retry_after.pop(brd.name, None)
                         if not self._can_start_new_job():
                             break
 
                         abs_brd = brd.resolve()
                         self.logger.info("Starting new process for %s", abs_brd.name)
 
-                        # clear stale stop flag
+                        # Clear only stale stop/yield flags for the new worker.
                         try:
                             shared = self.shared_data.get("shared_dict")
                             if shared is not None:
                                 shared[f"stop::{abs_brd.name}"] = False
+                                shared.pop(f"worker_yield::{abs_brd.name}", None)
                         except Exception:
                             pass
 
@@ -362,7 +423,8 @@ class JobManager:
                         proc = multiprocessing.Process(
                             target=brd_processor.process_single_brd_standalone,
                             args=(abs_brd, SAVED_FUNC_DIR, REGISTRY, self.gpt_semaphore,
-                                worker_log[0], self.shared_data, True if only_list else False),
+                                worker_log[0], self.shared_data, True if only_list else False,
+                                max(1, int(check_interval))),
                             name=f"BRD-{abs_brd.stem}"
                         )
 
@@ -579,10 +641,11 @@ class JobManager:
                     "PID %s already removed from active list", proc.pid
                 )
 
-            # Mark the BRD as available again, but do NOT automatically
-            # relaunch an unexpectedly crashed worker on the same BRD hash.
+            # Mark BRD available; clean exits may intentionally yield an idle slot.
             brd_done = self._pid_to_brd.pop(proc.pid, None)
             launched_hash = self._pid_to_brd_hash.pop(proc.pid, None)
+            if brd_done is not None and exit_code == 0:
+                self._consider_worker_yield(brd_done, proc.pid)
             watchdog_failure = self._timed_out_pids.pop(proc.pid, None)
             worker_log = self._pid_to_log.pop(proc.pid, None)
             if brd_done is not None:
@@ -607,6 +670,16 @@ class JobManager:
                             brd_done.read_text(encoding="utf-8")
                         )
                         if current_hash == launched_hash:
+                            pending_recovery = brd_processor.get_approved_handcrafted_recovery(
+                                REGISTRY, launched_hash, SAVED_FUNC_DIR, brd_done
+                            )
+                            if pending_recovery:
+                                # Failed/hung approved candidates do not get unlimited
+                                # retries after a hard process crash or timeout.
+                                brd_processor.finish_handcrafted_recovery(
+                                    REGISTRY, launched_hash, SAVED_FUNC_DIR, brd_done,
+                                    successful=False, registry_lock=self.shared_data.get("lock"),
+                                )
                             reason = (
                                 "Function call timed out after "
                                 f"{watchdog_failure['elapsed']:.1f}s "
@@ -931,6 +1004,19 @@ class JobManager:
 
 
 def main():
+    # Explicit human approval is the ONLY route to recover a blocked BRD
+    # without changing its BRD text. Stop JobManager before invoking this command.
+    if len(sys.argv) >= 2 and sys.argv[1] == "--approve-handcrafted":
+        if len(sys.argv) != 3 or pathlib.Path(sys.argv[2]).name != sys.argv[2]:
+            raise SystemExit("Usage: python job_manager.py --approve-handcrafted BRD_example.txt")
+        brd = PROJECT_ROOT / "documents" / sys.argv[2]
+        approval = brd_processor.approve_handcrafted_recovery(brd, SAVED_FUNC_DIR, REGISTRY)
+        print(f"Approved handcrafted retry: {brd.name} -> {approval['script']}")
+        print("Restart JobManager. The block clears ONLY if the handcrafted code passes all BRD and N-job tests.")
+        return
+    if len(sys.argv) > 1:
+        raise SystemExit("Usage: python job_manager.py [--approve-handcrafted BRD_example.txt]")
+
     # ── [1] safe start-method (Windows needs this BEFORE anything else) ──
     if multiprocessing.get_start_method(allow_none=True) is None:
         multiprocessing.set_start_method("spawn", force=True)

@@ -31,6 +31,8 @@ GPT_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_TOOL_TIMEOUT_SECONDS", 
 GPT_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_REQUEST_TIMEOUT_SECONDS", "60")))
 GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS", "60")))
 MAX_ATTEMPTS = 10
+# Maximum actionable records a BRD worker processes before yielding for fairness.
+MAX_JOBS_PER_WORKER_SESSION = max(1, int(os.getenv("MAX_JOBS_PER_WORKER_SESSION", "25")))
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
 
@@ -871,6 +873,96 @@ def get_brd_runtime_block(reg_path: pathlib.Path, hash_signature: str) -> dict |
     return block
 
 
+def get_approved_handcrafted_recovery(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    saved_func_dir: pathlib.Path,
+    brd_path: pathlib.Path,
+) -> dict | None:
+    """A human approval is valid only for this BRD hash and exact .py bytes."""
+    entry = load_registry(reg_path).get(hash_signature, {})
+    if not isinstance(entry, dict) or not get_brd_runtime_block(reg_path, hash_signature):
+        return None
+    approval = entry.get("handcrafted_recovery")
+    if not isinstance(approval, dict) or approval.get("brd_hash") != hash_signature:
+        return None
+    path = saved_func_dir / f"{brd_path.stem}_handcrafted" / str(approval.get("script", ""))
+    if path.suffix != ".py" or path.name != approval.get("script"):
+        return None
+    if _source_content_hash(path) != approval.get("content_hash"):
+        return None
+    return approval
+
+
+def approve_handcrafted_recovery(
+    brd_path: pathlib.Path, saved_func_dir: pathlib.Path, reg_path: pathlib.Path,
+) -> dict:
+    """Human-only CLI action: authorize ONE exact handwritten script for a blocked BRD.
+
+    This never unblocks the BRD or skips validation. The worker tests the approved
+    script against BRD examples AND the N real jobs before removing the block.
+    Stop the manager before invoking this CLI, so registry edits are serialized.
+    """
+    if not brd_path.is_file() or not brd_path.name.startswith("BRD_") or brd_path.suffix != ".txt":
+        raise ValueError("Provide a current BRD_*.txt file")
+    signature = brd_hash_signature(brd_path.read_text(encoding="utf-8"))
+    if not get_brd_runtime_block(reg_path, signature):
+        raise ValueError(f"BRD {brd_path.name} is not currently blocked for human review")
+    directory = saved_func_dir / f"{brd_path.stem}_handcrafted"
+    scripts = sorted(directory.glob("*.py"))
+    if len(scripts) != 1:
+        raise ValueError(f"Expected exactly one handwritten .py in {directory}; found {len(scripts)}")
+    script = scripts[0]
+    content_hash = _source_content_hash(script)
+    if content_hash is None:
+        raise ValueError("Cannot read handwritten source")
+    approval = {
+        "brd_hash": signature, "script": script.name, "content_hash": content_hash,
+        "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    reg = load_registry(reg_path)
+    reg[signature]["handcrafted_recovery"] = approval
+    save_registry(reg_path, reg)
+    return approval
+
+
+def finish_handcrafted_recovery(
+    reg_path: pathlib.Path, hash_signature: str, saved_func_dir: pathlib.Path,
+    brd_path: pathlib.Path, *, successful: bool, registry_lock=None,
+) -> None:
+    """Consume one approval; remove the persistent block ONLY after both gates pass."""
+    def _finish():
+        registry = load_registry(reg_path)
+        meta = registry.get(hash_signature, {})
+        approval = meta.get("handcrafted_recovery") if isinstance(meta, dict) else None
+        if not isinstance(approval, dict):
+            raise ValueError("Handcrafted recovery approval was revoked")
+        # For successful recovery recheck the file's content hash to prevent a
+        # silent source edit between approval, tests and activation.
+        path = saved_func_dir / f"{brd_path.stem}_handcrafted" / approval["script"]
+        if successful and _source_content_hash(path) != approval["content_hash"]:
+            raise ValueError("Handcrafted code changed since approval; human reapproval required")
+        meta.pop("handcrafted_recovery", None)
+        meta.setdefault("handcrafted_recovery_history", []).append({
+            "script": approval["script"], "content_hash": approval["content_hash"],
+            "status": "passed" if successful else "failed",
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        if successful:
+            meta.pop("runtime_block", None)
+            meta["quarantine"] = [
+                item for item in meta.get("quarantine", [])
+                if not (item.get("script") == approval["script"]
+                        and item.get("origin") == "handcrafted")
+            ]
+        save_registry(reg_path, registry)
+    if registry_lock is None:
+        _finish()
+    else:
+        with registry_lock:
+            _finish()
+
+
 def block_brd_until_changed(
     reg_path: pathlib.Path,
     hash_signature: str,
@@ -1204,6 +1296,7 @@ def process_jobs(
     input_specs: list[dict[str, Any]] | None = None,
     preview_limit: int = 1200,
     compare_expected: bool = True,
+    max_jobs: int | None = None,
 ) -> Tuple[bool, Optional[str]]:
     """Run runtime jobs with BRD input/output validation and durable progress state."""
     if not jobs_path.exists():
@@ -1269,7 +1362,9 @@ def process_jobs(
     LOG.info("Batch start for %s: %d actionable / %d total", jobs_path.name, len(new_jobs), len(jobs))
     unsaved = 0
 
-    for rec in new_jobs:
+    for index, rec in enumerate(new_jobs):
+        if max_jobs is not None and index >= max_jobs:
+            break  # Remaining records are picked up by the next scheduled worker.
         record_hash = _runtime_record_hash(rec)
         incident_id = "?"
 
@@ -1435,8 +1530,9 @@ def _get_or_create_function(
     logger,
     is_debug_mode: bool,
     reflection: str | None = None,
+    handcrafted_only: bool = False,
 ):
-    """Load or generate an implementation and let Python enforce the BRD contract/tests."""
+    """Load/generate implementations; an approved recovery may test ONLY handcrafted."""
     skip_reuse_once = bool(reflection)
     expected_function_name = schema["function_name"]
     param_names = [input_spec["name"] for input_spec in contract["input"]]
@@ -1449,7 +1545,7 @@ def _get_or_create_function(
 
     # [1] Handcrafted implementation.
     handcrafted = saved_func_dir / f"{brd_path.stem}_handcrafted"
-    if handcrafted.exists() and not skip_reuse_once:
+    if handcrafted.exists() and (handcrafted_only or not skip_reuse_once):
         logger.info("Found handcrafted dir %s", handcrafted)
         try:
             py_files = sorted(handcrafted.glob("*.py"))
@@ -1459,7 +1555,7 @@ def _get_or_create_function(
                 raise RuntimeError(f"Expected exactly one .py file in {handcrafted}; found {len(py_files)}")
             py_path = py_files[0]
             script_name = py_path.name
-            if is_quarantined(registry_path, hash_signature, script_name, script_path=py_path):
+            if not handcrafted_only and is_quarantined(registry_path, hash_signature, script_name, script_path=py_path):
                 logger.info("Handcrafted impl %s is quarantined; skipping.", script_name)
             else:
                 hc_mod = load_script(namespace=f"hc_{hash_signature}", py_path=py_path)
@@ -1507,6 +1603,10 @@ def _get_or_create_function(
             logger.warning("Handcrafted load/test failed: %s", exc)
     elif handcrafted.exists() and skip_reuse_once:
         logger.info("Previous batch failure -> skipping handcrafted reuse this loop.")
+
+    if handcrafted_only:
+        logger.error("Approved handcrafted recovery failed tests; no cached or GPT fallback is allowed")
+        return None, None, None
 
     # [2] Cached implementation.
     registry = load_registry(registry_path)
@@ -1789,6 +1889,17 @@ def process_single_brd_standalone(
     hb_misses_before_exit = HB_MISSES_BEFORE_EXIT
     warn_bad_BRD_every_x_seconds = 20  # only used later; keep here for readability
 
+    def _yield_slot(reason: str) -> None:
+        """Release execution capacity; manager reacts to future input/BRD changes."""
+        try:
+            shared_data["shared_dict"][f"worker_yield::{brd_path.name}"] = {
+                "pid": os.getpid(), "reason": reason,
+                "at": time.time(),
+            }
+        except (OSError, EOFError, BrokenPipeError):
+            pass
+        worker_logger.info("Yielding BRD worker slot: %s (%s)", brd_path.name, reason)
+
     # Make only the narrow GPT wrapper available to generated code.
     global _active_gpt_semaphore
     _active_gpt_semaphore = gpt_semaphore
@@ -2040,7 +2151,10 @@ def process_single_brd_standalone(
                     # Only the current BRD's hash is relevant; old hash blocks stay archived
                     # until the manager's normal registry cleanup prunes them.
                     persisted_block = get_brd_runtime_block(registry_path, current_hash)
-                    if persisted_block:
+                    approved_recovery = get_approved_handcrafted_recovery(
+                        registry_path, current_hash, saved_func_dir, brd_path
+                    )
+                    if persisted_block and not approved_recovery:
                         blocked_hash = current_hash
                         blocked_reason = persisted_block.get("reason", "human review required")
                     cached_func = None
@@ -2067,8 +2181,8 @@ def process_single_brd_standalone(
                             brd_path.name, blocked_reason or "no working function",
                         )
                         next_block_warn_ts = now + warn_bad_BRD_every_x_seconds
-                    time.sleep(min(5.0, check_interval * 2))
-                    continue
+                    _yield_slot("blocked")
+                    break
 
                 # ----------------- Python-owned BRD contract/tests -----------------
                 if (
@@ -2103,8 +2217,8 @@ def process_single_brd_standalone(
                         )
                         next_block_warn_ts = 0.0
                         module_logger.error("BRD inspector data invalid for %s: %s", brd_path.name, exc)
-                        time.sleep(check_interval)
-                        continue
+                        _yield_slot("wait_for_brd")
+                        break
                 else:
                     contract = cached_contract
                     brd_tests = cached_brd_tests
@@ -2154,8 +2268,8 @@ def process_single_brd_standalone(
                                 brd_path.name, exc, n_items_to_pass,
                             )
                             next_deployment_preflight_warn_ts = now + warn_bad_BRD_every_x_seconds
-                        time.sleep(min(5.0, check_interval * 2))
-                        continue
+                        _yield_slot("waiting_input")
+                        break
 
                     try:
                         func, func_name, impl_meta = _get_or_create_function(
@@ -2174,6 +2288,7 @@ def process_single_brd_standalone(
                             logger=module_logger,
                             is_debug_mode=is_debug_mode,
                             reflection=last_reflection,
+                            handcrafted_only=bool(approved_recovery),
                         )
                     except BlindDeploymentValidationFailure as exc:
                         # Do not retry, regenerate, or send any blind-test data to GPT.
@@ -2190,9 +2305,14 @@ def process_single_brd_standalone(
                             "Waiting for human BRD review/change.",
                             brd_path.name, exc,
                         )
-                        time.sleep(check_interval)
-                        continue
+                        _yield_slot("blocked")
+                        break
                     if func is None:
+                        if approved_recovery:
+                            finish_handcrafted_recovery(
+                                registry_path, current_hash, saved_func_dir, brd_path,
+                                successful=False, registry_lock=registry_lock,
+                            )
                         # Persist this block: a restart must not silently grant
                         # another ten blind-validation/generation opportunities.
                         blocked_hash = current_hash
@@ -2206,9 +2326,20 @@ def process_single_brd_standalone(
                             "Entering blocked mode for %s: %s. Will warn every %ss until BRD changes.",
                             brd_path.name, blocked_reason, warn_bad_BRD_every_x_seconds,
                         )
-                        time.sleep(check_interval * 2)
-                        continue
+                        _yield_slot("blocked")
+                        break
 
+                    if approved_recovery:
+                        # The manual candidate has passed both Python-owned gates.
+                        # Activation requires exact byte match to the approved script.
+                        finish_handcrafted_recovery(
+                            registry_path, current_hash, saved_func_dir, brd_path,
+                            successful=True, registry_lock=registry_lock,
+                        )
+                        module_logger.info(
+                            "HUMAN RECOVERY APPROVED: %s passed BRD examples and %d N-job checks; persistent block lifted",
+                            brd_path.name, n_items_to_pass,
+                        )
                     cached_func = func
                     last_impl_meta = impl_meta or {"origin": "unknown", "script_name": "<unknown>"}
                     try:
@@ -2272,8 +2403,8 @@ def process_single_brd_standalone(
                             has_new_jobs = False
                     except Exception as exc:
                         module_logger.error("Error checking jobs for %s: %s", brd_path.name, exc, exc_info=is_debug_mode)
-                        time.sleep(check_interval)
-                        continue
+                        _yield_slot("waiting_input")
+                        break
                 else:
                     if last_jobs_state != "idle":
                         module_logger.info("No jobs file for %s yet (%s).", brd_path.name, jobs_path.name)
@@ -2281,8 +2412,8 @@ def process_single_brd_standalone(
                     has_new_jobs = False
 
                 if not has_new_jobs:
-                    time.sleep(min(5.0, check_interval * 2))
-                    continue
+                    _yield_slot("idle")
+                    break
 
                 # ----------------- Process jobs (if any) -----------------
                 try:
@@ -2291,18 +2422,22 @@ def process_single_brd_standalone(
                         output_contract=contract["output"],
                         input_specs=contract["input"],
                         compare_expected=True,
+                        max_jobs=MAX_JOBS_PER_WORKER_SESSION,
                     )
                 except JobDataTemporarilyUnavailable as exc:
                     module_logger.warning(
                         "Skipping this polling cycle for %s: %s; will retry. "
                         "Active function remains unchanged.", brd_path.name, exc,
                     )
-                    time.sleep(check_interval)
-                    continue
+                    _yield_slot("waiting_input")
+                    break
                 if ok_batch:
                     worker_logger.info("✅ Jobs processed for %s", brd_path.name)
                     last_reflection = None
                     last_activity_time = now
+                    if len(new_jobs) > MAX_JOBS_PER_WORKER_SESSION:
+                        _yield_slot("quantum")
+                        break
                     time.sleep(check_interval)
                 else:
                     # This is a failure of a valid live job, not malformed job data.
@@ -2344,7 +2479,8 @@ def process_single_brd_standalone(
                         "No automatic GPT repair or subsequent real-job processing.",
                         brd_path.name,
                     )
-                    time.sleep(check_interval)
+                    _yield_slot("blocked")
+                    break
 
 
             except GPTServiceConfigurationError as exc:
@@ -2360,16 +2496,16 @@ def process_single_brd_standalone(
                 next_block_warn_ts = 0.0
                 last_reflection = None
                 module_logger.error("ESCALATE TO HUMAN: %s", blocked_reason)
-                time.sleep(check_interval)
-                continue
+                _yield_slot("blocked_configuration")
+                break
             except ExternalGPTUnavailable as exc:
                 module_logger.warning(
                     "External GPT service unavailable for %s (%s). "
                     "Will retry without quarantining or blocking the active function.",
                     brd_path.name, exc,
                 )
-                time.sleep(check_interval)
-                continue
+                _yield_slot("service_retry")
+                break
             except (BrokenPipeError, EOFError, OSError) as exc:
                 try: worker_logger.info("IPC channel gone (%s) — exiting %s.", type(exc).__name__, brd_path.name)
                 except Exception: pass
@@ -2415,10 +2551,12 @@ def process_single_brd_standalone(
                         )
                     except Exception as persist_exc:
                         module_logger.error("Failed to persist active-function block: %s", persist_exc)
-                    time.sleep(check_interval)
-                    continue
+                    _yield_slot("blocked")
+                    break
 
-                module_logger.exception("Loop error for %s (will retry): %s", brd_path.name, exc)
+                module_logger.exception("Loop error for %s: %s", brd_path.name, exc)
+                _yield_slot("wait_for_brd")
+                break
                 cached_func = None
                 cached_contract = None
                 cached_brd_tests = None
