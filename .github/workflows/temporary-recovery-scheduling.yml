@@ -1,0 +1,86 @@
+name: Temporary recovery and scheduler regression
+on:
+  push:
+    branches: [human-handcrafted-recovery-scheduling]
+jobs:
+  smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile source/brd_processor.py job_manager.py
+      - name: Test approved handwritten recovery and scheduler primitives
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,logging,pathlib,tempfile,time
+          from unittest.mock import patch
+          from source import brd_processor as bp
+          import job_manager as jm
+          BRD='''Test
+          4. FUNCTION INPUT/OUTPUT CONTRACT
+          ---------------------------------
+          {"input":[{"name":"text","type":"string"}],"output":{"type":"integer"}}
+          5. TEST EXAMPLES & EXPECTED RESULTS
+          -----------------------------------
+          [{"input":"hello world","output":2}]
+          6. JOBS DATA STRUCTURE
+          ----------------------
+          [{"incident_id":"A1","text":"hello world","expected":2}]
+          ID_FIELD=incident_id
+          EXPECTED_FIELD=expected
+          N_ITEMS_TO_PASS=1
+          '''
+          with tempfile.TemporaryDirectory() as tmp:
+              root=pathlib.Path(tmp)
+              docs=root/'documents';docs.mkdir()
+              saved=root/'saved_functions';saved.mkdir()
+              brd=docs/'BRD_demo.txt';brd.write_text(BRD)
+              jobs=docs/'BRD_demo_jobs.json'
+              jobs.write_text(json.dumps([{"incident_id":"A1","text":"hello world","expected":2},
+                                          {"incident_id":"A2","text":"hello world","expected":2}]))
+              handmade=saved/'BRD_demo_handcrafted';handmade.mkdir()
+              code=handmade/'impl.py'
+              code.write_text('def demo(text):\n    return len(text.split())\n')
+              registry=saved/'registry.json'
+              signature=bp.brd_hash_signature(BRD)
+              bp.block_brd_until_changed(registry,signature,brd.name,'runtime error',origin='live_job_failure')
+              approval=bp.approve_handcrafted_recovery(brd,saved,registry)
+              assert bp.get_approved_handcrafted_recovery(registry,signature,saved,brd)
+              contract=bp.extract_brd_contract(BRD)
+              tests=bp.extract_brd_tests(BRD,contract)
+              labeled,_=bp.prepare_deployment_validation_jobs(jobs,
+                 {'inputs':['text'],'incident_id':'incident_id','expected':'expected'},contract,1)
+              def never_gpt(*a,**k):raise AssertionError('recovery must never generate GPT code')
+              with patch.object(bp,'ask_gpt_with_naming_convention_to_make_func',new=never_gpt):
+                  func,_,meta=bp._get_or_create_function(brd,BRD,signature,
+                     {'function_name':'demo','incident_id':'incident_id','expected':'expected'},
+                     contract,tests,1,labeled,saved,registry,None,None,
+                     logging.getLogger('test'),False,handcrafted_only=True)
+              assert callable(func) and meta['origin']=='handcrafted'
+              bp.finish_handcrafted_recovery(registry,signature,saved,brd,successful=True)
+              assert bp.get_brd_runtime_block(registry,signature) is None
+              done=docs/'done_BRD_demo_jobs.json'
+              schema={'inputs':['text'],'incident_id':'incident_id','expected':'expected'}
+              assert bp.process_jobs(func,schema,jobs,done,max_jobs=1,
+                     output_contract=contract['output'],input_specs=contract['input'])[0]
+              assert bp._read_done_ids(done)=={'A1'}
+              jmgr=jm.JobManager.__new__(jm.JobManager)
+              jmgr.shared_data={'shared_dict':{}}
+              jmgr.logger=logging.getLogger('test')
+              jmgr._snoozed_fingerprints={}
+              jmgr._retry_after={}
+              jmgr._session_blocks=set()
+              jmgr.shared_data['shared_dict'][f'worker_yield::{brd.name}']={'pid':123,'reason':'idle'}
+              jmgr._consider_worker_yield(brd,123)
+              assert jmgr._snoozed_fingerprints[brd.name]==jmgr._work_fingerprint(brd)
+              jobs.write_text(jobs.read_text()+' ')
+              assert jmgr._snoozed_fingerprints[brd.name]!=jmgr._work_fingerprint(brd)
+          print('PASS: explicit approval, both gates, bounded progress, idle resume')
+          PY
