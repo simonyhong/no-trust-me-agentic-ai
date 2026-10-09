@@ -1,0 +1,54 @@
+name: Temporary blind validation regression
+on:
+  push:
+    branches: [blind-n-job-validation]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile source/brd_processor.py job_manager.py
+      - name: Blind N-job gate tests
+        run: |
+          python - <<'PY'
+          import logging
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          from source import brd_processor as bp
+          with tempfile.TemporaryDirectory() as d:
+              root = Path(d)
+              seen = []
+              def generate(*args):
+                  seen.append(args[-1])
+                  if len(seen) == 1:
+                      return "def word_count(text):\n    return 0\n"
+                  return "def word_count(text):\n    return len(text.split())\n"
+              def forbidden_save(*args, **kw):
+                  raise AssertionError("Failed holdout candidate must never be persisted.")
+              kwargs = dict(
+                  brd_path=root/"BRD_word_count.txt", brd_text="Count words.",
+                  hash_signature="test", schema={"function_name":"word_count","incident_id":"incident_id","expected":"expected_word_count"},
+                  contract={"input":[{"name":"text","type":"string"}],"output":{"type":"integer"}},
+                  brd_tests=[(("hello world",), 2, 1)], n_items_to_pass=1,
+                  deployment_jobs=[{"incident_id":"SECRET123","text":"secret holdout string","expected_word_count":99}],
+                  saved_func_dir=root/"saved_functions", registry_path=root/"saved_functions"/"registry.json",
+                  gpt_semaphore=None,registry_lock=None,logger=logging.getLogger("blind_test"),is_debug_mode=False,
+              )
+              with patch.object(bp,"ask_gpt_with_naming_convention_to_make_func",generate), patch.object(bp,"save_source",forbidden_save):
+                  try: bp._get_or_create_function(**kwargs)
+                  except bp.BlindDeploymentValidationFailure as e:
+                      assert "Human review required" in str(e)
+                      assert "SECRET123" not in str(e)
+                      assert "99" not in str(e)
+                  else: raise AssertionError("A blind failure must block the candidate.")
+              assert len(seen) == 2
+              assert seen[0] is None
+              assert "BRD" in seen[1]
+              assert all("secret holdout string" not in str(x) and "99" not in str(x) for x in seen)
+          print("PASS: BRD-only feedback; first blind holdout failure stops generation")
+          PY
