@@ -22,7 +22,6 @@ import logging, sys
 
 _RETRY_STEPS = 6
 MAX_ATTEMPTS = 10
-MAX_BATCH_FAILURES = 3
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
 
@@ -848,6 +847,43 @@ def load_registry(reg_path: pathlib.Path) -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
+def get_brd_runtime_block(reg_path: pathlib.Path, hash_signature: str) -> dict | None:
+    """Return the persistent, BRD-hash-scoped human-review block, if any."""
+    entry = load_registry(reg_path).get(hash_signature, {})
+    block = entry.get("runtime_block") if isinstance(entry, dict) else None
+    return block if isinstance(block, dict) else None
+
+
+def block_brd_until_changed(
+    reg_path: pathlib.Path,
+    hash_signature: str,
+    brd_filename: str,
+    reason: str,
+    *,
+    registry_lock=None,
+    origin: str = "runtime",
+) -> None:
+    """Persist escalation; a process restart cannot re-enable the same BRD hash."""
+    def _write():
+        registry = load_registry(reg_path)
+        entry = registry.setdefault(hash_signature, {})
+        entry.setdefault("title", brd_filename)
+        entry.setdefault("folder_name", pathlib.Path(brd_filename).stem)
+        if "runtime_block" not in entry:
+            entry["runtime_block"] = {
+                "reason": str(reason)[:500],
+                "origin": origin,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            save_registry(reg_path, registry)
+
+    if registry_lock is None:
+        _write()
+    else:
+        with registry_lock:
+            _write()
+
+
 def save_source(hash_signature: str, code: str, func_name: str, brd_path: pathlib.Path,
                 saved_func_dir, reg_path, registry_lock=None) -> str:
     brd_stem = brd_path.stem
@@ -1524,8 +1560,9 @@ def process_single_brd_standalone(
     Perpetually process a single BRD, checking for new jobs at regular intervals.
     Exits only on: per-BRD stop flag, signals, parent death, or IPC failure.
 
-    After repeated generation failures or repeated live-batch failures for one BRD
-    hash, enter a blocked state and wait for the BRD to change.
+    A valid live-job execution failure immediately quarantines the implementation
+    and blocks this BRD hash for human review; no automatic GPT regeneration.
+    Blocks are persisted across restarts in the registry.
     """
     import signal, os, psutil
     import logging
@@ -1653,11 +1690,10 @@ def process_single_brd_standalone(
     last_reflection = None
     last_impl_meta = None
 
-    # Blocked state: after repeated failures for a specific BRD hash
+    # Blocked state: persisted in registry by BRD hash, remains until human changes BRD.
     blocked_hash: str | None = None
     blocked_reason: str | None = None
     next_block_warn_ts: float = 0.0  # throttle warnings to 20s
-    batch_fail_count = 0
     next_deployment_preflight_warn_ts = 0.0
 
     def _should_stop() -> bool:
@@ -1750,8 +1786,13 @@ def process_single_brd_standalone(
                     blocked_hash = None
                     blocked_reason = None
                     next_block_warn_ts = 0.0
-                    batch_fail_count = 0
                     worker_logger.info("BRD content changed — invalidating cache for %s", brd_path.name)
+                    # Only the current BRD's hash is relevant; old hash blocks stay archived
+                    # until the manager's normal registry cleanup prunes them.
+                    persisted_block = get_brd_runtime_block(registry_path, current_hash)
+                    if persisted_block:
+                        blocked_hash = current_hash
+                        blocked_reason = persisted_block.get("reason", "human review required")
                     cached_func = None
                     cached_contract = None
                     cached_brd_tests = None
@@ -1761,6 +1802,10 @@ def process_single_brd_standalone(
                     next_deployment_preflight_warn_ts = 0.0
                     last_reflection = None
                     last_impl_meta = None
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
                     last_brd_hash = current_hash
                     last_activity_time = now
 
@@ -1886,6 +1931,10 @@ def process_single_brd_standalone(
                         blocked_reason = str(exc)
                         next_block_warn_ts = 0.0
                         last_reflection = None
+                        block_brd_until_changed(
+                            registry_path, current_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="blind_deployment",
+                        )
                         module_logger.error(
                             "Blind deployment validation stopped %s: %s "
                             "Waiting for human BRD review/change.",
@@ -1907,6 +1956,15 @@ def process_single_brd_standalone(
 
                     cached_func = func
                     last_impl_meta = impl_meta or {"origin": "unknown", "script_name": "<unknown>"}
+                    try:
+                        shared_data["shared_dict"][f"active_impl::{brd_path.name}"] = {
+                            "hash": current_hash,
+                            "origin": last_impl_meta.get("origin", "unknown"),
+                            "script_name": last_impl_meta.get("script_name", "<unknown>"),
+                            "script_path": last_impl_meta.get("script_path"),
+                        }
+                    except Exception as exc:
+                        module_logger.warning("Cannot publish active implementation metadata: %s", exc)
                     last_activity_time = now
 
                 # ----------------- Jobs derivation -----------------
@@ -1981,11 +2039,12 @@ def process_single_brd_standalone(
                 if ok_batch:
                     worker_logger.info("✅ Jobs processed for %s", brd_path.name)
                     last_reflection = None
-                    batch_fail_count = 0
                     last_activity_time = now
                     time.sleep(check_interval)
                 else:
-                    worker_logger.warning("❌ Batch failed for %s: %s", brd_path.name, reflection)
+                    # This is a failure of a valid live job, not malformed job data.
+                    # Stop immediately: never auto-repair a deployed function via GPT.
+                    worker_logger.error("❌ Live-job function failure for %s: %s", brd_path.name, reflection)
                     try:
                         if last_impl_meta and last_brd_hash == current_hash:
                             add_quarantine(
@@ -1993,36 +2052,35 @@ def process_single_brd_standalone(
                                 hash_signature=current_hash,
                                 script_name=last_impl_meta.get("script_name", "<unknown>"),
                                 origin=last_impl_meta.get("origin", "unknown"),
-                                reason=(reflection or "batch failed"),
+                                reason=(reflection or "live-job function failure"),
                                 registry_lock=registry_lock,
                                 script_path=last_impl_meta.get("script_path"),
                             )
-                            module_logger.info(
-                                "Quarantined %s (%s) for BRD hash %s",
-                                last_impl_meta.get("script_name"), last_impl_meta.get("origin"), current_hash,
-                            )
                     except Exception as q_exc:
-                        module_logger.warning("Failed to quarantine impl: %s", q_exc)
+                        module_logger.error("Could not quarantine implementation: %s", q_exc)
 
-                    # Never send real-job inputs, expected values, or actual outputs
-                    # back to the code-generating LLM. The human-facing details
-                    # remain in logs and quarantine metadata for investigation.
-                    last_reflection = (
-                        "A previously deployed implementation failed during real-job execution. "
-                        "Real-job details are withheld. Reimplement strictly from the "
-                        "BRD and its author-supplied examples; do not infer unseen jobs."
-                    )
+                    blocked_hash = current_hash
+                    blocked_reason = "Deployed function failed on a valid live job; human review required"
+                    next_block_warn_ts = 0.0
+                    last_reflection = None
                     cached_func = None
                     last_impl_meta = None
-                    batch_fail_count += 1
-                    if batch_fail_count >= MAX_BATCH_FAILURES:
-                        blocked_hash = current_hash
-                        blocked_reason = (
-                            f"{batch_fail_count} consecutive live-batch failures; "
-                            f"last: {(reflection or '')[:200]}"
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
+                    try:
+                        block_brd_until_changed(
+                            registry_path, current_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="live_job_failure",
                         )
-                        next_block_warn_ts = 0.0
-                        module_logger.warning("Entering blocked mode for %s: %s", brd_path.name, blocked_reason)
+                    except Exception as exc:
+                        module_logger.error("Could not persist human-review block for %s: %s", brd_path.name, exc)
+                    module_logger.error(
+                        "ESCALATE TO HUMAN: BRD %s is blocked. "
+                        "No automatic GPT repair or subsequent real-job processing.",
+                        brd_path.name,
+                    )
                     time.sleep(check_interval)
 
 
