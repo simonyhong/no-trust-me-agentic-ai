@@ -155,7 +155,7 @@ saved_functions/registry.json
 saved_functions/BRD_word_count/
 ```
 
-**Job answers are logged only.** The manager no longer writes `results_BRD_*_jobs.json` output files, and on startup it deletes obsolete results files left by earlier versions. If you need historical job answers, retain the logs or send outputs to an external destination before relying on this mode. Output values are not recoverable from the `done_*.json` state.
+**Job answers are logged only.** The program does not create separate results JSON files. If you need historical job answers, retain the logs or send outputs to an external destination before relying on this mode. Output values are not recoverable from the `done_*.json` state.
 
 The `done_*.json` file tracks processed job IDs and rejected-record hashes. The worker flushes state after bounded batches of 50 successful jobs and on batch completion or failure; a crash may cause a small amount of reprocessing since the last flush. Malformed runtime records are recorded under `rejected` using a hash of their content; correcting a record changes its hash and makes it eligible again. These runtime-generated files are intentionally ignored by Git.
 
