@@ -978,7 +978,6 @@ def process_jobs(
     *,
     output_contract: dict[str, Any] | None = None,
     input_specs: list[dict[str, Any]] | None = None,
-    results_file: Optional[pathlib.Path] = None,
     preview_limit: int = 1200,
     compare_expected: bool = True,
 ) -> Tuple[bool, Optional[str]]:
@@ -1006,10 +1005,7 @@ def process_jobs(
 
     if done_file is None:
         done_file = jobs_path.parent / f"done_{jobs_path.stem}.json"
-    if results_file is None:
-        results_file = jobs_path.parent / f"results_{jobs_path.stem}.json"
     done_file.parent.mkdir(parents=True, exist_ok=True)
-    results_file.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         raw_done = json.loads(done_file.read_text(encoding="utf-8"))
@@ -1019,25 +1015,9 @@ def process_jobs(
         done_ids = set()
         rejected = {}
 
-    try:
-        raw_results = json.loads(results_file.read_text(encoding="utf-8"))
-        results: Dict[str, Any] = dict(raw_results.get("results", {}))
-    except Exception:
-        results = {}
-
-    def _persist_results() -> bool:
-        try:
-            _atomic_write_json(results_file, {"results": results})
-            return True
-        except Exception as exc:
-            LOG.warning("Could not write results file %s: %s", results_file, exc)
-            return False
-
     def _persist_done() -> None:
-        # Results are persisted first so done-state never claims a successful job
-        # whose output is absent from the local results file.
-        if not _persist_results():
-            return
+        # Job answers are logged, not written to a separate results file.
+        # Keep only durable processed/rejected job state.
         try:
             _atomic_write_json(done_file, {"ids": sorted(done_ids), "rejected": rejected})
         except Exception as exc:
@@ -1136,7 +1116,6 @@ def process_jobs(
                     return False, reflection
 
             LOG.info("incident_id=%s: %s", incident_id, result)
-            results[incident_id] = result
             done_ids.add(incident_id)
             # If a corrected record for this incident succeeds, clear older rejection entries for that ID.
             rejected = {

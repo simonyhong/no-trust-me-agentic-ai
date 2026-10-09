@@ -823,16 +823,24 @@ def main():
     # ── [2] resolve project root ────────────────────────────────────────
     root = PROJECT_ROOT
 
-    # ── [3] optional DEBUG helper: purge done markers so all jobs rerun ─
+    # ── [3] clean obsolete result files; optionally reset done-state ───
     docs_dir = root / "documents"
     docs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Previous versions wrote job outputs to separate results_*.json files.
+    # Outputs now go to the log only; clean up obsolete local artifacts.
+    for old_results_file in docs_dir.glob("results_BRD_*_jobs.json"):
+        try:
+            old_results_file.unlink()
+            logging.info("Removed obsolete results file %s", old_results_file)
+        except OSError as exc:
+            logging.warning("Could not remove obsolete results file %s: %s", old_results_file, exc)
 
     if RESET_DONE_STATE:
         deleted_state_files = 0
         for jobs_json in docs_dir.glob("BRD_*_jobs.json"):
             for state_file in (
                 jobs_json.parent / f"done_{jobs_json.stem}.json",
-                jobs_json.parent / f"results_{jobs_json.stem}.json",
             ):
                 if state_file.exists():
                     state_file.unlink()
