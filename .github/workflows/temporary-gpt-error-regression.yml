@@ -1,0 +1,82 @@
+name: Temporary GPT error regression
+on:
+  push:
+    branches: [classify-gpt-errors-and-block-fallback]
+jobs:
+  regression:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile source/brd_processor.py job_manager.py
+      - name: Verify classification and caught-tool-failure handling
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util,json,logging,pathlib,tempfile,types
+          from unittest.mock import patch
+          from source import brd_processor as bp
+
+          class MockHTTP(Exception):
+              def __init__(self,status_code,msg):
+                  super().__init__(msg);self.status_code=status_code
+
+          for code,category in [(400,'request'),(401,'configuration'),(403,'configuration'),
+                                (404,'configuration'),(422,'request'),(429,'transient'),
+                                (500,'transient'),(503,'transient')]:
+              assert bp._classify_gpt_error(MockHTTP(code,"fake"))==category,code
+          assert bp._classify_gpt_error(MockHTTP(400,"content_filter"))=="configuration"
+          assert bp._classify_gpt_error(TimeoutError("network"))=="transient"
+
+          bp._active_gpt_semaphore=object()
+          bp._active_function_watchdog=None
+          def invalid(text):
+              try: bp._generated_ask_gpt("bad string")
+              except Exception: return 2
+          ok,failures=bp.run_brd_tests(invalid,[(("two words",),2,1)],
+                                       {"output":{"type":"integer"}})
+          assert not ok and "GPTToolRequestRejected" in str(failures),failures
+
+          with tempfile.TemporaryDirectory() as d:
+              root=pathlib.Path(d)
+              jobs=root/"BRD_demo_jobs.json"
+              done=root/"done.json"
+              jobs.write_text(json.dumps([{"incident_id":"A1","text":"input"}]))
+              def hidden_outage(text):
+                  try: bp._generated_ask_gpt([{"role":"user","content":text}])
+                  except Exception: return -1
+              with patch.object(bp,"gpt_call_with_retry",side_effect=TimeoutError("down")):
+                  try:bp.process_jobs(hidden_outage,
+                      {"inputs":["text"],"incident_id":"incident_id","expected":"expected"},
+                      jobs,done,output_contract={"type":"integer"},
+                      input_specs=[{"name":"text","type":"string"}])
+                  except bp.ExternalGPTUnavailable: pass
+                  else:raise AssertionError("Caught outage must discard fallback")
+              assert "A1" not in json.loads(done.read_text())["ids"]
+              blockreg=root/"registry.json"
+              bp.block_brd_until_changed(blockreg,"abcd1234","BRD_demo.txt",
+                  "no working function after 10 attempts",origin="generation_exhausted")
+              assert bp.get_brd_runtime_block(blockreg,"abcd1234")["origin"]=="generation_exhausted"
+
+          bp._active_gpt_semaphore=None
+          # Local .env must precede GPT timeout parsing.
+          with tempfile.TemporaryDirectory() as d:
+              root=pathlib.Path(d)
+              (root/"source").mkdir()
+              original=pathlib.Path(bp.__file__).read_text(encoding="utf-8")
+              (root/"source"/"temp_processor.py").write_text(original,encoding="utf-8")
+              (root/".env").write_text("GPT_TOOL_TIMEOUT_SECONDS=13\n")
+              import os
+              with patch.dict(os.environ,{},clear=True):
+                  spec=importlib.util.spec_from_file_location("env_test_processor",root/"source"/"temp_processor.py")
+                  module=importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  assert module.GPT_TOOL_TIMEOUT_SECONDS==13
+          print("PASS: HTTP classification, suppressed outcomes, persistent block, early env load")
+          PY
