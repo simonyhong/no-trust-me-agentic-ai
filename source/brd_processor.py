@@ -20,6 +20,11 @@ import tempfile
 import ast
 import logging, sys
 
+# Load a developer-local .env before reading any configured timeout.
+# Existing shell/environment variables take precedence.
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
 _RETRY_STEPS = 6
 # Limits for GPT as an external service; independent of function-compute watchdog.
 GPT_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_TOOL_TIMEOUT_SECONDS", "180")))
@@ -28,11 +33,6 @@ GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAI
 MAX_ATTEMPTS = 10
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
-
-# Load a developer-local .env file from the repository root if present.
-# Existing shell/environment variables take precedence (override=False).
-_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -748,7 +748,7 @@ def run_deployment_validation_jobs(
 
         try:
             result = _invoke_monitored(func, *params, phase="deployment_validation")
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             raise
         except Exception as exc:
             reflection = (
@@ -810,7 +810,7 @@ def run_brd_tests(
     for args, expected, test_index in tests:
         try:
             got = _invoke_monitored(func, *args, phase="brd_example")
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             raise
         except Exception as exc:
             feedback.append(f"BRD test #{test_index}: args={args!r} -> raised {type(exc).__name__}: {exc}")
@@ -935,6 +935,47 @@ def brd_hash_signature(txt: str, length: int = 8) -> str:
     return hashlib.blake2s(txt.encode(), digest_size=16).hexdigest()[:length]
 
 
+class ExternalGPTUnavailable(RuntimeError):
+    """Transient approved GPT service failure; retry without blaming the function."""
+
+
+class GPTToolRequestRejected(ValueError):
+    """Malformed approved GPT-tool request, potentially fixable in BRD examples."""
+
+
+class GPTServiceConfigurationError(RuntimeError):
+    """Credentials, deployment, access policy, or service setup requires a human."""
+
+
+def _classify_gpt_error(exc: BaseException) -> str:
+    """One of 'transient', 'request', or 'configuration'. Never default to retry."""
+    if isinstance(exc, ExternalGPTUnavailable):
+        return "transient"
+    if isinstance(exc, GPTToolRequestRejected):
+        return "request"
+    if isinstance(exc, GPTServiceConfigurationError):
+        return "configuration"
+    if isinstance(exc, (RateLimitError, APIConnectionError, APITimeoutError, TimeoutError)):
+        return "transient"
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        if status == 429 or status >= 500:
+            return "transient"
+        if status in (401, 403, 404):
+            return "configuration"
+        if status == 400 and any(
+            marker in str(exc).lower()
+            for marker in ("content_filter", "content filter", "policy_violation")
+        ):
+            return "configuration"
+        if 400 <= status < 500:
+            return "request"
+    if isinstance(exc, (TypeError, ValueError)):
+        return "request"
+    # Unexpected SDK failures are not automatically recoverable outages.
+    return "configuration"
+
+
 _temperature_unsupported = False
 
 
@@ -947,7 +988,7 @@ def gpt_call_with_retry(semaphore, **kwargs):
     """
     global _temperature_unsupported
     if gpt_client is None or not my_tools.gpt_model:
-        raise RuntimeError(
+        raise GPTServiceConfigurationError(
             "Azure OpenAI is not configured. Set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, "
             "and AZURE_OPENAI_DEPLOYMENT. AZURE_OPENAI_API_VERSION is optional."
         )
@@ -987,10 +1028,10 @@ def gpt_call_with_retry(semaphore, **kwargs):
                 _temperature_unsupported = True
                 LOG.warning("Deployment rejected temperature; retrying without it (remembered for this worker).")
                 continue
-            if status != 429:
-                LOG.exception("GPT hard error")
+            if status != 429 and not (isinstance(status, int) and status >= 500):
+                LOG.exception("GPT permanently rejected the request")
                 raise
-            LOG.warning("GPT 429 - backing off")
+            LOG.warning("GPT rate-limited or server error (%s) - backing off", status)
         except (APIConnectionError, APITimeoutError) as exc:
             last_error = exc
             LOG.warning("GPT transport/timeout error (%s) - backing off", type(exc).__name__)
@@ -1009,30 +1050,51 @@ def gpt_call_with_retry(semaphore, **kwargs):
     ) from last_error
 
 
-class ExternalGPTUnavailable(RuntimeError):
-    """Transient external GPT/tool failure, not evidence of defective function code."""
-
+# Track all GPT tool failures within the current monitored function call.
+# A generated function cannot hide an outage by catching its exception and
+# returning a fabricated "successful" fallback answer.
+_gpt_tool_issue_during_call: tuple[str, str] | None = None
 
 
 def _generated_ask_gpt(messages, temperature=0):
-    """Approved GPT wrapper: exclude external-service waits from compute budget."""
-    if _active_gpt_semaphore is None:
-        raise ExternalGPTUnavailable("Generated-code GPT tool is unavailable outside an active BRD worker")
-    kwargs = {"messages": messages}
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
+    """Approved GPT wrapper; distinguish transient, invalid, and setup errors."""
+    global _gpt_tool_issue_during_call
     mark, phase = _active_function_watchdog, _monitored_phase
     if mark is not None and phase is not None:
         mark("pause", phase)
     try:
         try:
+            if _active_gpt_semaphore is None:
+                raise GPTServiceConfigurationError(
+                    "Generated-code GPT tool is unavailable outside an active BRD worker"
+                )
+            # Validate the wrapper contract before invoking the provider SDK.
+            # Avoid treating a malformed generated-code argument as a service outage.
+            if not isinstance(messages, list) or not messages or not all(
+                isinstance(item, dict) and isinstance(item.get("role"), str)
+                and "content" in item for item in messages
+            ):
+                raise GPTToolRequestRejected(
+                    "my_tools.ask_gpt(messages): messages must be a nonempty list "
+                    "of role/content dictionaries, not a string or arbitrary object"
+                )
+            kwargs = {"messages": messages}
+            if temperature is not None:
+                kwargs["temperature"] = temperature
             response = gpt_call_with_retry(_active_gpt_semaphore, **kwargs)
             return response.choices[0].message.content
         except Exception as exc:
-            # The failure occurred in the approved external tool, not in
-            # the user-authored/generated function implementation itself.
-            raise ExternalGPTUnavailable(f"GPT service/tool error: {type(exc).__name__}: {exc}") from exc
+            classification = _classify_gpt_error(exc)
+            detail = f"{type(exc).__name__}: {exc}"
+            if phase is not None:
+                _gpt_tool_issue_during_call = (classification, detail[:500])
+            if classification == "transient":
+                raise ExternalGPTUnavailable(f"GPT temporarily unavailable: {detail}") from exc
+            if classification == "request":
+                raise GPTToolRequestRejected(f"my_tools.ask_gpt rejected request: {detail}") from exc
+            raise GPTServiceConfigurationError(
+                f"GPT configuration/access requires human review: {detail}"
+            ) from exc
     finally:
         if mark is not None and phase is not None:
             mark("resume", phase)
@@ -1075,15 +1137,43 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
     may kill this worker while code runs. It is intentionally *not* set while
     Python waits for the code-generating GPT API.
     """
-    global _monitored_phase
+    global _monitored_phase, _gpt_tool_issue_during_call
     mark = _active_function_watchdog
     previous_phase = _monitored_phase
+    previous_issue = _gpt_tool_issue_during_call
     if mark is not None:
         mark("start", phase)
     _monitored_phase = phase
+    _gpt_tool_issue_during_call = None
     try:
-        return func(*args, **kwargs)
+        try:
+            result = func(*args, **kwargs)
+        except Exception as exc:
+            # A generated function may have caught a tool error, then failed
+            # for another reason. Preserve the true tool-failure classification.
+            if _gpt_tool_issue_during_call is not None:
+                kind, detail = _gpt_tool_issue_during_call
+                if kind == "transient":
+                    raise ExternalGPTUnavailable(detail) from exc
+                if kind == "configuration":
+                    raise GPTServiceConfigurationError(detail) from exc
+            raise
+        if _gpt_tool_issue_during_call is not None:
+            kind, detail = _gpt_tool_issue_during_call
+            if kind == "transient":
+                raise ExternalGPTUnavailable(
+                    f"GPT outage during function call; output discarded: {detail}"
+                )
+            if kind == "configuration":
+                raise GPTServiceConfigurationError(
+                    f"GPT configuration problem during function call; output discarded: {detail}"
+                )
+            raise GPTToolRequestRejected(
+                f"Generated function suppressed an invalid GPT request; output discarded: {detail}"
+            )
+        return result
     finally:
+        _gpt_tool_issue_during_call = previous_issue
         _monitored_phase = previous_phase
         if mark is not None:
             mark("end", phase)
@@ -1256,7 +1346,7 @@ def process_jobs(
                 _persist_done()
                 unsaved = 0
 
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             _persist_done()
             raise
         except Exception as exc:
@@ -1400,7 +1490,7 @@ def _get_or_create_function(
                     logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.warning("Handcrafted impl failed BRD-authored tests/contract")
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             raise
         except Exception as exc:
             logger.warning("Handcrafted load/test failed: %s", exc)
@@ -1449,7 +1539,7 @@ def _get_or_create_function(
                     logger.info("Cached impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.info("Cache invalid – BRD-authored tests/contract failed")
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             raise
         except Exception as exc:
             logger.warning("Cache load/test failed: %s", exc)
@@ -1483,11 +1573,20 @@ def _get_or_create_function(
             if is_debug_mode:
                 logger.info("GPT response:\n%s", resp)
         except Exception as exc:
-            # The generator API failed before candidate code could be evaluated.
-            # Do not consume code-repair attempts or block a BRD due to service outage.
-            raise ExternalGPTUnavailable(
-                f"GPT code-generation service unavailable: {type(exc).__name__}: {exc}"
-            ) from exc
+            kind = _classify_gpt_error(exc)
+            if kind == "transient":
+                # Service outage does not consume code-repair attempts.
+                raise ExternalGPTUnavailable(
+                    f"GPT code-generation service temporarily unavailable: {type(exc).__name__}: {exc}"
+                ) from exc
+            if kind == "configuration":
+                raise GPTServiceConfigurationError(
+                    f"GPT code-generation configuration/policy error: {type(exc).__name__}: {exc}"
+                ) from exc
+            # A rejected generator request counts toward the ten-attempt cap.
+            local_reflection = f"GPT request rejected: {type(exc).__name__}: {exc}"
+            logger.error("Attempt %d: GPT generation request invalid: %s", attempt, exc)
+            continue
 
         try:
             code = clean_generated_code(resp)
@@ -1517,7 +1616,7 @@ def _get_or_create_function(
             if not callable(func):
                 raise ValueError(f"Function {expected_function_name} not found or not callable")
             logger.info("Code compilation successful - function %s loaded", expected_function_name)
-        except ExternalGPTUnavailable:
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
             raise
         except Exception as exc:
             local_reflection = f"Your code did not compile:\n{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}"
@@ -2083,10 +2182,15 @@ def process_single_brd_standalone(
                         time.sleep(check_interval)
                         continue
                     if func is None:
-                        # Enter blocked mode for this BRD hash
+                        # Persist this block: a restart must not silently grant
+                        # another ten blind-validation/generation opportunities.
                         blocked_hash = current_hash
-                        blocked_reason = f"no working function after up to {MAX_ATTEMPTS} generation attempts; see earlier ERROR"
+                        blocked_reason = f"no working function after up to {MAX_ATTEMPTS} generation attempts; human review required"
                         next_block_warn_ts = 0.0
+                        block_brd_until_changed(
+                            registry_path, current_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="generation_exhausted",
+                        )
                         module_logger.warning(
                             "Entering blocked mode for %s: %s. Will warn every %ss until BRD changes.",
                             brd_path.name, blocked_reason, warn_bad_BRD_every_x_seconds,
@@ -2232,6 +2336,20 @@ def process_single_brd_standalone(
                     time.sleep(check_interval)
 
 
+            except GPTServiceConfigurationError as exc:
+                # Service credentials, deployment name or provider policy are
+                # external configuration issues, not function defects.
+                blocked_hash = current_hash
+                blocked_reason = f"GPT configuration/policy failure; human review required: {str(exc)[:250]}"
+                next_block_warn_ts = 0.0
+                last_reflection = None
+                block_brd_until_changed(
+                    registry_path, current_hash, brd_path.name, blocked_reason,
+                    registry_lock=registry_lock, origin="gpt_service_configuration",
+                )
+                module_logger.error("ESCALATE TO HUMAN: %s", blocked_reason)
+                time.sleep(check_interval)
+                continue
             except ExternalGPTUnavailable as exc:
                 module_logger.warning(
                     "External GPT service unavailable for %s (%s). "
