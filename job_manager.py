@@ -21,65 +21,9 @@ SAVED_FUNC_DIR = PROJECT_ROOT / "saved_functions"
 REGISTRY = SAVED_FUNC_DIR / "registry.json"
 MAX_RECORD_BYTES = 64_000     # 64 KB cap per log record
 RESET_DONE_STATE = os.getenv("RESET_DONE_STATE", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-class SafeQueueHandler(logging.handlers.QueueHandler):
-    def __init__(self, q, fallback_path: str | None = None, formatter: logging.Formatter | None = None):
-        super().__init__(q)
-        self._dead = False
-        self._fallback_path = fallback_path
-        self._fallback = None
-        self._fallback_formatter = formatter
-
-    def _get_fallback(self):
-        if self._fallback is None and self._fallback_path:
-            self._fallback = logging.FileHandler(self._fallback_path, mode="a", encoding="utf-8")
-            if self._fallback_formatter:
-                self._fallback.setFormatter(self._fallback_formatter)
-        return self._fallback
-
-    def emit(self, record):
-        if self._dead:
-            fallback = self._get_fallback()
-            if fallback:
-                try:
-                    fallback.emit(record)
-                except Exception:
-                    pass
-            return
-
-        try:
-            rec = self.prepare(record)
-            if isinstance(rec.msg, str) and len(rec.msg) > MAX_RECORD_BYTES:
-                rec.msg = rec.msg[:MAX_RECORD_BYTES] + " …<truncated>"
-            self.enqueue(rec)
-        except queue.Full:
-            # Transient back-pressure: divert only this record and keep the queue handler alive.
-            fallback = self._get_fallback()
-            if fallback:
-                try:
-                    fallback.emit(record)
-                except Exception:
-                    pass
-        except Exception:
-            self._dead = True
-            fallback = self._get_fallback()
-            if fallback:
-                try:
-                    fallback.emit(record)
-                except Exception:
-                    pass
-
-    def close(self):
-        self._dead = True
-        if self._fallback is not None:
-            try:
-                self._fallback.close()
-            except Exception:
-                pass
-        try:
-            super().close()
-        except Exception:
-            pass
+# Wall-clock limit for each generated-function invocation. Set to 0 to disable.
+# This watchdog limits accidental hangs; it is not a security sandbox.
+FUNCTION_CALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_CALL_TIMEOUT_SECONDS", "120"))
 
 ##################################### Job Manager ###################################################
 SEMAPHORE_LIMIT = 5 # Only 5 concurrent GPT calls allowed 
@@ -91,6 +35,8 @@ class JobManager:
         self._inflight_brds: set[pathlib.Path] = set()
         self._pid_to_brd: dict[int, pathlib.Path] = {}
         self._pid_to_brd_hash: dict[int, str] = {}
+        self._pid_to_log: dict[int, tuple] = {}
+        self._timed_out_pids: dict[int, dict] = {}
         self._blocked_log_ts: dict[str, float] = {}
         self.active_processes = []
         self.gpt_semaphore = multiprocessing.BoundedSemaphore(SEMAPHORE_LIMIT)
@@ -118,8 +64,8 @@ class JobManager:
         self._console_enabled = bool(to_activate_console)
         self._show_time = bool(show_time)
 
-        # Queue that workers write into
-        self.log_q = multiprocessing.Queue(maxsize=10_000)
+        # Each worker has its own log queue. Manager log records bypass worker
+        # queues so a crashed worker cannot silence ESCALATE messages.
 
         # Fresh file each run
         log_path = str(PROJECT_ROOT / "all_process.log")
@@ -148,24 +94,16 @@ class JobManager:
             console.setFormatter(formatter)
             sinks.append(console)
 
-        # Start the listener that formats everything (workers send raw records)
-        self._log_listener = logging.handlers.QueueListener(
-            self.log_q, *sinks, respect_handler_level=True
-        )
-        self._log_listener.start()
-
-        # App logger (do NOT touch root)
+        # Worker listeners share synchronized logging handlers, but each gets
+        # a distinct queue. The manager writes directly to those handlers.
+        self._log_sinks = sinks
         self.logger = logging.getLogger("JobManager")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
-
-        # Queue handler; fallback file is created lazily only if the queue fails
-        self._qh = SafeQueueHandler(
-            self.log_q,
-            fallback_path=str(PROJECT_ROOT / "all_process_fallback.log"),
-            formatter=formatter,
-        )
-        self.logger.addHandler(self._qh)
+        for handler in list(self.logger.handlers):
+            self.logger.removeHandler(handler)
+        for handler in sinks:
+            self.logger.addHandler(handler)
         # ───────────────────────────────────────────────────────────────
 
         # bookkeeping
@@ -355,6 +293,7 @@ class JobManager:
                     current_time = time.time()
 
                     # housekeeping
+                    self._check_function_timeouts()
                     self._cleanup_finished()
 
                     if current_time - last_function_clean_time >= 60:
@@ -419,10 +358,11 @@ class JobManager:
                             self.logger.warning("Skipping %s — cannot read (%s).", abs_brd.name, exc)
                             continue
 
+                        worker_log = self._start_worker_log()
                         proc = multiprocessing.Process(
                             target=brd_processor.process_single_brd_standalone,
                             args=(abs_brd, SAVED_FUNC_DIR, REGISTRY, self.gpt_semaphore,
-                                self.log_q, self.shared_data, True if only_list else False),
+                                worker_log[0], self.shared_data, True if only_list else False),
                             name=f"BRD-{abs_brd.stem}"
                         )
 
@@ -432,10 +372,12 @@ class JobManager:
                             self._inflight_brds.add(brd)
                             self._pid_to_brd[proc.pid] = brd
                             self._pid_to_brd_hash[proc.pid] = launch_hash
+                            self._pid_to_log[proc.pid] = worker_log
                             self.logger.info("Started process %d for %s", proc.pid, brd.name)
                         except Exception as exc:
                             self.logger.error("Failed to start process for %s: %s", brd.name, exc)
                             self._inflight_brds.discard(brd)
+                            self._stop_worker_log(worker_log)
 
                     # periodic status
                     if (current_time - last_log_time >= 10):
@@ -501,6 +443,81 @@ class JobManager:
     def _can_start_new_job(self) -> bool:
         return len(self.active_processes) < self.max_concurrent_BRD_agents
 
+    def _start_worker_log(self) -> tuple:
+        """Create a private log queue and daemon listener for one worker."""
+        q = multiprocessing.Queue(maxsize=10_000)
+        listener = logging.handlers.QueueListener(
+            q, *self._log_sinks, respect_handler_level=True
+        )
+        listener.start()
+        return q, listener
+
+    def _stop_worker_log(self, worker_log, timeout: float = 3.0) -> None:
+        """Bound the wait if a dying worker left a damaged queue record."""
+        if not worker_log:
+            return
+        q, listener = worker_log
+        try:
+            listener.enqueue_sentinel()
+        except Exception:
+            pass
+        thread = getattr(listener, "_thread", None)
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                self.logger.warning(
+                    "Worker log stream did not drain after %.1fs; "
+                    "some final worker messages may be lost.", timeout,
+                )
+            else:
+                listener._thread = None
+        try:
+            q.cancel_join_thread()
+            q.close()
+        except (OSError, ValueError):
+            pass
+
+    def _check_function_timeouts(self) -> None:
+        """Terminate timed-out worker functions; cleanup subsequently blocks BRD."""
+        timeout = FUNCTION_CALL_TIMEOUT_SECONDS
+        if timeout <= 0:
+            return
+        try:
+            shared = self.shared_data["shared_dict"]
+        except (KeyError, OSError):
+            return
+        now = time.monotonic()
+        for proc in list(self.active_processes):
+            if not proc.is_alive() or proc.pid in self._timed_out_pids:
+                continue
+            brd = self._pid_to_brd.get(proc.pid)
+            if brd is None:
+                continue
+            try:
+                state = shared.get(f"function_call::{brd.name}")
+                if not isinstance(state, dict) or state.get("pid") != proc.pid:
+                    continue
+                started = float(state.get("started_monotonic", now))
+                elapsed = now - started
+                if elapsed <= timeout:
+                    continue
+                phase = str(state.get("phase", "function_call"))
+                self._timed_out_pids[proc.pid] = {
+                    "phase": phase, "elapsed": elapsed, "limit": timeout,
+                }
+                self.logger.error(
+                    "ESCALATE TO HUMAN: function call in BRD %s (%s) exceeded "
+                    "%.1fs timeout (elapsed %.1fs); terminating worker PID %s.",
+                    brd.name, phase, timeout, elapsed, proc.pid,
+                )
+                proc.terminate()
+                proc.join(timeout=2)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=2)
+            except Exception as exc:
+                self.logger.error("Function watchdog error for %s: %s", brd.name, exc)
+
     def _cleanup_finished(self):
         """
         Remove completed worker processes from `self.active_processes`
@@ -562,6 +579,8 @@ class JobManager:
             # relaunch an unexpectedly crashed worker on the same BRD hash.
             brd_done = self._pid_to_brd.pop(proc.pid, None)
             launched_hash = self._pid_to_brd_hash.pop(proc.pid, None)
+            watchdog_failure = self._timed_out_pids.pop(proc.pid, None)
+            worker_log = self._pid_to_log.pop(proc.pid, None)
             if brd_done is not None:
                 self._inflight_brds.discard(brd_done)
                 shared = self.shared_data.get("shared_dict")
@@ -574,13 +593,24 @@ class JobManager:
                 except Exception:
                     pass
 
-                unexpected_exit = exit_code != 0 and not stop_requested and brd_done.is_file()
+                unexpected_exit = (
+                    (exit_code != 0 or watchdog_failure is not None)
+                    and not stop_requested and brd_done.is_file()
+                )
                 if unexpected_exit and launched_hash:
                     try:
                         current_hash = brd_processor.brd_hash_signature(
                             brd_done.read_text(encoding="utf-8")
                         )
                         if current_hash == launched_hash:
+                            reason = (
+                                "Function call timed out after "
+                                f"{watchdog_failure['elapsed']:.1f}s "
+                                f"(limit {watchdog_failure['limit']:.1f}s; "
+                                f"phase={watchdog_failure['phase']})"
+                                if watchdog_failure is not None
+                                else f"Unexpected worker process exit (code={exit_code})"
+                            )
                             # A hard worker exit does not prove the generated function
                             # was responsible; conservatively stop this BRD for review.
                             if isinstance(active_impl, dict) and active_impl.get("hash") == launched_hash:
@@ -590,7 +620,7 @@ class JobManager:
                                         hash_signature=launched_hash,
                                         script_name=active_impl.get("script_name", "<unknown>"),
                                         origin=active_impl.get("origin", "unknown"),
-                                        reason=f"Unexpected worker process exit (code={exit_code})",
+                                        reason=reason,
                                         registry_lock=self.shared_data.get("lock"),
                                         script_path=active_impl.get("script_path"),
                                     )
@@ -600,7 +630,7 @@ class JobManager:
                                     )
                             brd_processor.block_brd_until_changed(
                                 REGISTRY, launched_hash, brd_done.name,
-                                f"Unexpected worker process exit (code={exit_code}); human review required",
+                                reason + "; human review required",
                                 registry_lock=self.shared_data.get("lock"),
                                 origin="unexpected_worker_exit",
                             )
@@ -624,6 +654,20 @@ class JobManager:
                 try:
                     if shared is not None:
                         shared[f"stop::{brd_done.name}"] = False
+                except Exception:
+                    pass
+
+            # Abandon only this worker's potentially corrupted logging pipe.
+            # The manager's own logs go directly to the file handler.
+            self._stop_worker_log(worker_log)
+            # A worker killed during a call may leave a stale marker.
+            if brd_done is not None:
+                try:
+                    shared = self.shared_data.get("shared_dict")
+                    if shared is not None:
+                        marker = shared.get(f"function_call::{brd_done.name}")
+                        if isinstance(marker, dict) and marker.get("pid") == proc.pid:
+                            shared.pop(f"function_call::{brd_done.name}", None)
                 except Exception:
                     pass
 
@@ -705,6 +749,8 @@ class JobManager:
                 self._inflight_brds.discard(target_brd)
                 self._pid_to_brd.pop(target_proc.pid, None)
                 self._pid_to_brd_hash.pop(target_proc.pid, None)
+                self._stop_worker_log(self._pid_to_log.pop(target_proc.pid, None))
+                self._timed_out_pids.pop(target_proc.pid, None)
                 try:
                     shared = self.shared_data.get("shared_dict")
                     if shared is not None:
@@ -735,6 +781,8 @@ class JobManager:
         self._inflight_brds.discard(target_brd)
         self._pid_to_brd.pop(target_proc.pid, None)
         self._pid_to_brd_hash.pop(target_proc.pid, None)
+        self._stop_worker_log(self._pid_to_log.pop(target_proc.pid, None))
+        self._timed_out_pids.pop(target_proc.pid, None)
         return False
 
     def _deep_cleanup(self):
@@ -818,6 +866,9 @@ class JobManager:
             except ValueError:
                 pass
             brd_done = self._pid_to_brd.pop(p.pid, None)
+            self._pid_to_brd_hash.pop(p.pid, None)
+            self._timed_out_pids.pop(p.pid, None)
+            self._stop_worker_log(self._pid_to_log.pop(p.pid, None))
             if brd_done is not None:
                 self._inflight_brds.discard(brd_done)
                 try:
@@ -848,32 +899,10 @@ class JobManager:
         except Exception:
             pass
 
-        # 6) DETACH queue handler first so nothing else enqueues
-        try:
-            if hasattr(self, "_qh") and self._qh:
-                try:
-                    self.logger.removeHandler(self._qh)
-                except Exception:
-                    pass
-                try:
-                    self._qh.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 7) stop listener (drains queue into handlers), then close the queue
-        try:
-            if hasattr(self, "_log_listener") and self._log_listener:
-                self._log_listener.stop()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "log_q") and self.log_q:
-                self.log_q.close()
-                self.log_q.join_thread()
-        except Exception:
-            pass
+        # 6) Each worker stream has a bounded drain. Never wait forever on a
+        # queue record corrupted by abrupt worker termination.
+        for pid in list(self._pid_to_log):
+            self._stop_worker_log(self._pid_to_log.pop(pid, None))
 
         # 8) shut down the multiprocessing.Manager (after workers are gone)
         try:
@@ -883,7 +912,8 @@ class JobManager:
 
         # 9) final logging shutdown (no more handlers should reference the queue)
         try:
-            self.logger.handlers[:] = []
+            for handler in list(self.logger.handlers):
+                self.logger.removeHandler(handler)
             logging.shutdown()
         except Exception:
             pass

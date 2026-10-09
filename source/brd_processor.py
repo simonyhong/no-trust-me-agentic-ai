@@ -742,7 +742,7 @@ def run_deployment_validation_jobs(
         expected = rec[exp_field]
 
         try:
-            result = func(*params)
+            result = _invoke_monitored(func, *params, phase="deployment_validation")
         except Exception as exc:
             reflection = (
                 f"Function crashed on deployment-validation job #{ordinal} "
@@ -802,7 +802,7 @@ def run_brd_tests(
 
     for args, expected, test_index in tests:
         try:
-            got = func(*args)
+            got = _invoke_monitored(func, *args, phase="brd_example")
         except Exception as exc:
             feedback.append(f"BRD test #{test_index}: args={args!r} -> raised {type(exc).__name__}: {exc}")
             ok = False
@@ -1006,6 +1006,30 @@ def _runtime_record_hash(record: Any) -> str:
     return hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 
+class JobDataTemporarilyUnavailable(RuntimeError):
+    """Jobs data was unavailable or incomplete; not a function defect."""
+
+
+def _invoke_monitored(func, *args, phase="function_call", **kwargs):
+    """Mark only generated-function execution for the manager watchdog.
+
+    This is a recovery timeout, not a filesystem/security sandbox. The watchdog
+    may kill this worker while code runs. It is intentionally *not* set while
+    Python waits for the code-generating GPT API.
+    """
+    mark = _active_function_watchdog
+    if mark is not None:
+        mark("start", phase)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if mark is not None:
+            mark("end", phase)
+
+
+_active_function_watchdog = None
+
+
 def process_jobs(
     func: Callable[..., Any],
     jobs_schema: Dict[str, Any],
@@ -1019,16 +1043,22 @@ def process_jobs(
 ) -> Tuple[bool, Optional[str]]:
     """Run runtime jobs with BRD input/output validation and durable progress state."""
     if not jobs_path.exists():
-        LOG.info("No jobs file found for %s - skipping batch run.", jobs_path.name)
-        return True, None
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} is temporarily missing; will retry"
+        )
 
     try:
         jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        LOG.error("Failed to read or parse jobs file %s: %s", jobs_path.name, exc, exc_info=True)
-        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # Upstream writers may be updating the file: this is a DATA problem.
+        # Do not misclassify it as a generated-function failure.
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} unavailable/incomplete: {type(exc).__name__}: {exc}"
+        ) from exc
     if not isinstance(jobs, list):
-        raise ValueError(f"Jobs file {jobs_path.name} must contain a JSON list of records")
+        raise JobDataTemporarilyUnavailable(
+            f"Jobs file {jobs_path.name} is not a JSON list of job records"
+        )
     if not jobs:
         LOG.info("Empty jobs file %s - nothing to do.", jobs_path.name)
         return True, None
@@ -1120,7 +1150,7 @@ def process_jobs(
 
         params = [rec[name] for name in param_names]
         try:
-            result = func(*params)
+            result = _invoke_monitored(func, *params, phase="live_job")
 
             if output_contract is not None:
                 valid, reason = _validate_value_against_contract(result, output_contract, "function output")
@@ -1324,7 +1354,8 @@ def _get_or_create_function(
                 logger.info("Cached impl %s is quarantined; skipping.", script_name)
             else:
                 _static_safety_check(cached_path.read_text(encoding="utf-8"))
-                cached_mod = load_script(
+                cached_mod = _invoke_monitored(
+                    load_script, phase="cached_code_load",
                     namespace=f"saved_{hash_signature}",
                     saved_func_dir=saved_func_dir,
                     hash_signature=hash_signature,
@@ -1409,7 +1440,7 @@ def _get_or_create_function(
 
         try:
             ns = {"my_tools": my_tools}
-            exec(code, ns)
+            _invoke_monitored(exec, code, ns, phase="generated_code_load")
             func = ns.get(expected_function_name)
             if not callable(func):
                 raise ValueError(f"Function {expected_function_name} not found or not callable")
@@ -1673,6 +1704,27 @@ def process_single_brd_standalone(
             except Exception: pass
 
     # ---------- runtime state ----------
+    # Each spawned BRD worker owns its own monitoring callback. Only an active
+    # function call is timed; regular polling and GPT code generation are not.
+    global _active_function_watchdog
+    def _mark_function_call(event: str, phase: str) -> None:
+        key = f"function_call::{brd_path.name}"
+        try:
+            shared = shared_data["shared_dict"]
+            if event == "start":
+                shared[key] = {
+                    "pid": os.getpid(),
+                    "started_monotonic": time.monotonic(),
+                    "phase": phase,
+                }
+            else:
+                state = shared.get(key)
+                if isinstance(state, dict) and state.get("pid") == os.getpid():
+                    shared.pop(key, None)
+        except (OSError, EOFError, BrokenPipeError):
+            pass  # Manager loss is handled separately by the worker lifecycle.
+
+    _active_function_watchdog = _mark_function_call
     parent_pid = os.getppid()
     heartbeat_interval = 10.0
     last_heartbeat_check = time.time()
@@ -2030,12 +2082,20 @@ def process_single_brd_standalone(
                     continue
 
                 # ----------------- Process jobs (if any) -----------------
-                ok_batch, reflection = process_jobs(
-                    cached_func, jobs_schema, jobs_path, done_file,
-                    output_contract=contract["output"],
-                    input_specs=contract["input"],
-                    compare_expected=True,
-                )
+                try:
+                    ok_batch, reflection = process_jobs(
+                        cached_func, jobs_schema, jobs_path, done_file,
+                        output_contract=contract["output"],
+                        input_specs=contract["input"],
+                        compare_expected=True,
+                    )
+                except JobDataTemporarilyUnavailable as exc:
+                    module_logger.warning(
+                        "Skipping this polling cycle for %s: %s; will retry. "
+                        "Active function remains unchanged.", brd_path.name, exc,
+                    )
+                    time.sleep(check_interval)
+                    continue
                 if ok_batch:
                     worker_logger.info("✅ Jobs processed for %s", brd_path.name)
                     last_reflection = None
@@ -2145,6 +2205,16 @@ def process_single_brd_standalone(
         module_logger.exception("Fatal error in perpetual processing for %s: %s", brd_path.name, exc)
         raise
     finally:
+        # No hanging/stale watchdog markers after a graceful shutdown.
+        _active_function_watchdog = None
+        try:
+            shared = shared_data["shared_dict"]
+            key = f"function_call::{brd_path.name}"
+            state = shared.get(key)
+            if isinstance(state, dict) and state.get("pid") == os.getpid():
+                shared.pop(key, None)
+        except Exception:
+            pass
         # Final summary, then detach handler from all loggers and close once
         try:
             mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)

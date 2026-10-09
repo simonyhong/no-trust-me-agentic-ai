@@ -114,7 +114,13 @@ A normal BRD content change invalidates the active in-memory function, clears pr
 
 Human-review blocks are stored in `saved_functions/registry.json` under `runtime_block`, so restarting the manager does not silently allow another attempt for the same BRD content. After investigating, edit the BRD to create a new hash (which triggers fresh validation), or explicitly clear the current hash's `runtime_block` in the registry while the manager is stopped after approving an alternative implementation. Editing only the generated/handcrafted Python file does not clear the persistent block.
 
-**Current limitation:** An infinite loop or a process stuck inside a generated function cannot be stopped reliably by the existing job timeout logic; separate sandbox execution with enforced timeouts is a future improvement.
+**Function execution watchdog:** The manager now records when a BRD example, deployment-validation check, live job, or generated-code load actually calls executable function code. If a call exceeds `FUNCTION_CALL_TIMEOUT_SECONDS` (default **120 seconds**, set to `0` to disable), JobManager terminates the worker, blocks the BRD hash, and escalates for human review. GPT code-generation API calls and ordinary polling are not subject to this function-call timer. This is a reliability watchdog, **not a security sandbox**.
+
+**Logging resilience:** Each BRD worker now writes to its own logging queue; manager escalation messages go directly to the log handlers. Shutdown waits at most three seconds for each worker log stream so a hard-crashed worker cannot indefinitely block Ctrl+C or suppress the manager's logs.
+
+**Temporary jobs-file failures:** If `BRD_*_jobs.json` is missing, incomplete or invalid during live processing, the worker logs a warning and retries next polling cycle **without** quarantining the implementation. Job-producing agents should still use atomic file replacement (`write temporary JSON -> os.replace`) to avoid partial reads.
+
+**Remaining limitation:** The watchdog can terminate a stuck worker, but it does not restrict arbitrary filesystem/network access by a generated function. Resource isolation remains a separate future sandboxing task.
 
 **Scope of blindness:** The code-**generating** LLM does not receive real-job test feedback. If a BRD deliberately requires an LLM-powered function (through `my_tools.ask_gpt`), that runtime LLM may still receive individual job inputs to perform its authorized task; it is not provided the expected test answers by the validator.
 
