@@ -109,3 +109,11 @@ jobs:
                   job_manager.REGISTRY=original_registry
           print("PASS: failed worker process blocks same BRD content hash")
           PY
+      - name: Export updated Python files
+        uses: actions/upload-artifact@v4
+        with:
+          name: human_escalation_python_files
+          path: |
+            source/brd_processor.py
+            job_manager.py
+          retention-days: 1
