@@ -1,0 +1,91 @@
+name: Temporary function invocation budgets
+on:
+  push:
+    branches: [function-total-wall-gpt-call-budget]
+jobs:
+  validation:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile job_manager.py source/brd_processor.py
+      - name: GPT-call count and paused wall-time regression
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast, logging, os, pathlib, time, types
+          from unittest.mock import patch
+          from source import brd_processor as bp
+          import job_manager as jm
+          assert jm.FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS > 0
+          assert bp.MAX_GPT_CALLS_PER_FUNCTION > 0
+
+          # Test real nested marker callback without starting a manager process.
+          src=pathlib.Path(bp.__file__).read_text(encoding='utf-8')
+          tree=ast.parse(src)
+          worker=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='process_single_brd_standalone')
+          marker=next(n for n in ast.walk(worker) if isinstance(n,ast.FunctionDef) and n.name=='_mark_function_call')
+          single=ast.Module(body=[marker],type_ignores=[])
+          ast.fix_missing_locations(single)
+          brd=pathlib.Path('BRD_example.txt'); shared={}
+          space={'os':os,'time':time,'brd_path':brd,'shared_data':{'shared_dict':shared}}
+          exec(compile(single,'marker','exec'),space)
+          cb=space['_mark_function_call']
+          bp._active_function_watchdog=cb
+          bp._active_gpt_semaphore=object()
+          response=types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content='ok'))])
+          actual_calls=[]
+          def mock_gpt(*a,**kw):
+              actual_calls.append(1)
+              return response
+          def caught_excess(_):
+              for i in range(10):
+                  try:bp._generated_ask_gpt([{'role':'user','content':'test'}])
+                  except Exception:pass
+              return 123
+
+          with patch.object(bp,'MAX_GPT_CALLS_PER_FUNCTION',2),patch.object(bp,'gpt_call_with_retry',side_effect=mock_gpt):
+              try:bp._invoke_monitored(caught_excess,'hello',phase='brd_example')
+              except bp.FunctionExecutionLimitExceeded:pass
+              else:raise AssertionError('Caught excess call returned a success')
+          assert len(actual_calls)==2,actual_calls
+          assert not shared,shared
+
+          class P:
+              pid=12345
+              def __init__(self):self.terminated=False
+              def is_alive(self):return True
+              def terminate(self):self.terminated=True
+              def join(self,timeout=None):pass
+              def kill(self):self.terminated=True
+          proc=P()
+          state={'pid':proc.pid,'phase':'live_job','paused':True,
+                 'gpt_slot_held':True,'wall_started_monotonic':time.monotonic()-20,
+                 'started_monotonic':time.monotonic()}
+          shared[f'function_call::{brd.name}']=state
+          manager=jm.JobManager.__new__(jm.JobManager)
+          manager.shared_data={'shared_dict':shared}
+          manager.active_processes=[proc]
+          manager._pid_to_brd={proc.pid:brd}
+          manager._timed_out_pids={}
+          manager.logger=logging.getLogger('budgets-ci')
+          with patch.object(jm,'FUNCTION_CALL_TIMEOUT_SECONDS',1.0),patch.object(jm,'FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS',2.0):
+              manager._check_function_timeouts()
+              assert shared[f'function_call::{brd.name}']['cancel_requested']
+              assert not proc.terminated
+              manager._timed_out_pids[proc.pid]['requested_at']=time.monotonic()-10
+              manager._check_function_timeouts()
+              assert not proc.terminated # slot held => extended grace
+              shared[f'function_call::{brd.name}']['gpt_slot_held']=False
+              manager._check_function_timeouts()
+              assert proc.terminated
+          bp._active_function_watchdog=None
+          bp._active_gpt_semaphore=None
+          print('PASS: count cap rejects caught errors; wall deadline detects paused calls; held slots get grace')
+          PY
