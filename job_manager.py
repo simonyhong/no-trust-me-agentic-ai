@@ -497,6 +497,10 @@ class JobManager:
                 state = shared.get(f"function_call::{brd.name}")
                 if not isinstance(state, dict) or state.get("pid") != proc.pid:
                     continue
+                if state.get("paused", False):
+                    # Approved GPT/tool I/O is excluded from the computation budget;
+                    # the parent enforces its separate tool-call deadline.
+                    continue
                 started = float(state.get("started_monotonic", now))
                 elapsed = now - started
                 if elapsed <= timeout:
