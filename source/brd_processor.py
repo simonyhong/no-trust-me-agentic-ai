@@ -2092,6 +2092,46 @@ def process_single_brd_standalone(
                 worker_logger.info("KeyboardInterrupt — exiting %s", brd_path.name)
                 break
             except Exception as exc:
+                if cached_func is not None and last_impl_meta and last_brd_hash:
+                    # A valid active implementation was running when the
+                    # unexpected loop exception occurred: fail closed for
+                    # human investigation, not automatic LLM regeneration.
+                    module_logger.exception(
+                        "ESCALATE TO HUMAN: unexpected active-function loop failure for %s: %s",
+                        brd_path.name, exc,
+                    )
+                    try:
+                        add_quarantine(
+                            reg_path=registry_path,
+                            hash_signature=last_brd_hash,
+                            script_name=last_impl_meta.get("script_name", "<unknown>"),
+                            origin=last_impl_meta.get("origin", "unknown"),
+                            reason=f"Unexpected active-function loop error: {type(exc).__name__}: {exc}",
+                            registry_lock=registry_lock,
+                            script_path=last_impl_meta.get("script_path"),
+                        )
+                    except Exception as quarantine_exc:
+                        module_logger.error("Quarantine failed: %s", quarantine_exc)
+                    blocked_hash = last_brd_hash
+                    blocked_reason = "Unexpected exception while active function was running; human review required"
+                    next_block_warn_ts = 0.0
+                    last_reflection = None
+                    cached_func = None
+                    last_impl_meta = None
+                    try:
+                        shared_data["shared_dict"].pop(f"active_impl::{brd_path.name}", None)
+                    except Exception:
+                        pass
+                    try:
+                        block_brd_until_changed(
+                            registry_path, blocked_hash, brd_path.name, blocked_reason,
+                            registry_lock=registry_lock, origin="active_function_loop_error",
+                        )
+                    except Exception as persist_exc:
+                        module_logger.error("Failed to persist active-function block: %s", persist_exc)
+                    time.sleep(check_interval)
+                    continue
+
                 module_logger.exception("Loop error for %s (will retry): %s", brd_path.name, exc)
                 cached_func = None
                 cached_contract = None
