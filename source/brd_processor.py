@@ -997,7 +997,8 @@ def _read_rejected_hashes(done_file: pathlib.Path) -> set[str]:
         data = json.loads(done_file.read_text(encoding="utf-8"))
         rejected = data.get("rejected", {})
         return set(rejected) if isinstance(rejected, dict) else set()
-    except (FileNotFoundError, json.JSONDecodeError):        return set()
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
 
 
 def _runtime_record_hash(record: Any) -> str:
@@ -1996,7 +1997,8 @@ def process_single_brd_standalone(
                     if func is None:
                         # Enter blocked mode for this BRD hash
                         blocked_hash = current_hash
-                        blocked_reason = f"no working function after up to {MAX_ATTEMPTS} generation attempts; see earlier ERROR"                        next_block_warn_ts = 0.0
+                        blocked_reason = f"no working function after up to {MAX_ATTEMPTS} generation attempts; see earlier ERROR"
+                        next_block_warn_ts = 0.0
                         module_logger.warning(
                             "Entering blocked mode for %s: %s. Will warn every %ss until BRD changes.",
                             brd_path.name, blocked_reason, warn_bad_BRD_every_x_seconds,
