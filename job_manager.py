@@ -90,6 +90,8 @@ class JobManager:
         self.max_concurrent_BRD_agents = max_concurrent_BRD_agents
         self._inflight_brds: set[pathlib.Path] = set()
         self._pid_to_brd: dict[int, pathlib.Path] = {}
+        self._pid_to_brd_hash: dict[int, str] = {}
+        self._blocked_log_ts: dict[str, float] = {}
         self.active_processes = []
         self.gpt_semaphore = multiprocessing.BoundedSemaphore(SEMAPHORE_LIMIT)
 
@@ -374,6 +376,26 @@ class JobManager:
                     for brd in brd_files:
                         if brd in self._inflight_brds:
                             continue
+
+                        # A block is tied to the exact BRD content hash, and persists
+                        # across JobManager restarts. A human BRD edit yields a new hash.
+                        try:
+                            launch_hash = brd_processor.brd_hash_signature(
+                                brd.read_text(encoding="utf-8")
+                            )
+                            block = brd_processor.get_brd_runtime_block(REGISTRY, launch_hash)
+                        except (OSError, UnicodeError) as exc:
+                            self.logger.warning("Cannot inspect BRD %s: %s", brd.name, exc)
+                            continue
+                        if block:
+                            key = f"{brd.name}:{launch_hash}"
+                            if current_time - self._blocked_log_ts.get(key, 0) >= 30:
+                                self.logger.error(
+                                    "ESCALATE TO HUMAN: not launching blocked %s (BRD hash %s): %s",
+                                    brd.name, launch_hash, block.get("reason", "human review required"),
+                                )
+                                self._blocked_log_ts[key] = current_time
+                            continue
                         if not self._can_start_new_job():
                             break
 
@@ -409,6 +431,7 @@ class JobManager:
                             self.active_processes.append(proc)
                             self._inflight_brds.add(brd)
                             self._pid_to_brd[proc.pid] = brd
+                            self._pid_to_brd_hash[proc.pid] = launch_hash
                             self.logger.info("Started process %d for %s", proc.pid, brd.name)
                         except Exception as exc:
                             self.logger.error("Failed to start process for %s: %s", brd.name, exc)
@@ -535,13 +558,70 @@ class JobManager:
                     "PID %s already removed from active list", proc.pid
                 )
 
-            # mark the BRD as available again    
+            # Mark the BRD as available again, but do NOT automatically
+            # relaunch an unexpectedly crashed worker on the same BRD hash.
             brd_done = self._pid_to_brd.pop(proc.pid, None)
+            launched_hash = self._pid_to_brd_hash.pop(proc.pid, None)
             if brd_done is not None:
                 self._inflight_brds.discard(brd_done)
-                # Clear stop flag for this BRD to avoid leaking True
+                shared = self.shared_data.get("shared_dict")
+                stop_requested = False
+                active_impl = None
                 try:
-                    shared = self.shared_data.get("shared_dict")
+                    if shared is not None:
+                        stop_requested = bool(shared.get(f"stop::{brd_done.name}", False))
+                        active_impl = shared.pop(f"active_impl::{brd_done.name}", None)
+                except Exception:
+                    pass
+
+                unexpected_exit = exit_code != 0 and not stop_requested and brd_done.is_file()
+                if unexpected_exit and launched_hash:
+                    try:
+                        current_hash = brd_processor.brd_hash_signature(
+                            brd_done.read_text(encoding="utf-8")
+                        )
+                        if current_hash == launched_hash:
+                            # A hard worker exit does not prove the generated function
+                            # was responsible; conservatively stop this BRD for review.
+                            if isinstance(active_impl, dict) and active_impl.get("hash") == launched_hash:
+                                try:
+                                    brd_processor.add_quarantine(
+                                        reg_path=REGISTRY,
+                                        hash_signature=launched_hash,
+                                        script_name=active_impl.get("script_name", "<unknown>"),
+                                        origin=active_impl.get("origin", "unknown"),
+                                        reason=f"Unexpected worker process exit (code={exit_code})",
+                                        registry_lock=self.shared_data.get("lock"),
+                                        script_path=active_impl.get("script_path"),
+                                    )
+                                except Exception as exc:
+                                    self.logger.error(
+                                        "Could not quarantine implementation after worker exit: %s", exc
+                                    )
+                            brd_processor.block_brd_until_changed(
+                                REGISTRY, launched_hash, brd_done.name,
+                                f"Unexpected worker process exit (code={exit_code}); human review required",
+                                registry_lock=self.shared_data.get("lock"),
+                                origin="unexpected_worker_exit",
+                            )
+                            self.logger.error(
+                                "ESCALATE TO HUMAN: worker for %s exited unexpectedly (%s). "
+                                "BRD hash %s blocked; no automatic restart.",
+                                brd_done.name, exit_code, launched_hash,
+                            )
+                        else:
+                            self.logger.warning(
+                                "Worker %s exited after its BRD changed (%s -> %s); "
+                                "new BRD content is not blocked.",
+                                proc.pid, launched_hash, current_hash,
+                            )
+                    except Exception as exc:
+                        self.logger.error(
+                            "Could not persist worker-exit escalation for %s: %s",
+                            brd_done.name, exc,
+                        )
+                # Clear stop flag for this BRD to avoid leaking True.
+                try:
                     if shared is not None:
                         shared[f"stop::{brd_done.name}"] = False
                 except Exception:
@@ -624,6 +704,7 @@ class JobManager:
                     pass
                 self._inflight_brds.discard(target_brd)
                 self._pid_to_brd.pop(target_proc.pid, None)
+                self._pid_to_brd_hash.pop(target_proc.pid, None)
                 try:
                     shared = self.shared_data.get("shared_dict")
                     if shared is not None:
@@ -653,6 +734,7 @@ class JobManager:
             pass
         self._inflight_brds.discard(target_brd)
         self._pid_to_brd.pop(target_proc.pid, None)
+        self._pid_to_brd_hash.pop(target_proc.pid, None)
         return False
 
     def _deep_cleanup(self):
