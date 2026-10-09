@@ -96,6 +96,26 @@ For each current BRD hash, the worker tries candidates in this order:
 
 Every candidate must pass the same Python-owned validation: all BRD-authored tests plus the first `N_ITEMS_TO_PASS` labeled jobs.
 
+## Explicit human-approved recovery of a blocked BRD
+
+When a BRD is persistently blocked because its active implementation failed, a programmer can supply a handcrafted replacement **without changing the BRD text or manually deleting registry entries**:
+
+1. **Stop** `job_manager.py` so the approval file and registry cannot be edited simultaneously by workers.
+2. Put exactly one reviewed Python source file in `saved_functions/<BRD stem>_handcrafted/`. The file should implement the BRD-derived function name (for example `word_count()` for `BRD_word_count.txt`).
+3. Execute `python job_manager.py --approve-handcrafted BRD_word_count.txt`. This records explicit human authorization tied to the **current BRD content hash** and the **exact source file content hash**.
+4. Restart `job_manager.py`. It tries **only that approved handcrafted function**, not the cache and not GPT, and independently checks the BRD-authored examples and first `N_ITEMS_TO_PASS` labeled jobs.
+5. Only after **both** checks pass does Python remove the persistent `runtime_block` and activate the handcrafted function. On failure the approval is consumed, the BRD remains blocked, and the attempt is recorded in `handcrafted_recovery_history`. Edit the function and issue a fresh approval to try again.
+
+An approved source edit after authorization invalidates the approval. A function that hangs or crashes during approved recovery also consumes its approval and remains blocked. This remains an explicit *human authorization*, not a security sandbox.
+
+## Fair scheduling of more BRDs than worker slots
+
+`max_concurrent_BRD_agents=10` limits **simultaneously running processes**, not the total number of BRDs. Workers that finish their actionable jobs, are blocked, lack sufficient labeled input data, or encounter unreadable jobs data now **yield their slots**. JobManager continues scanning all BRDs and relaunches them when BRD/jobs/done-state file metadata changes; it does not repeatedly relaunch unchanged idle jobs.
+
+For fairness, each worker processes at most `MAX_JOBS_PER_WORKER_SESSION=25` actionable records before yielding. BRDs with large backlogs resume after a short **5-second** scheduling cooldown, allowing other queued BRDs a turn. A transient GPT outage yields its slot and retries after **45 seconds**; a configuration/policy failure blocks the BRD for the **manager session**, until the operator corrects the settings and restarts. All completed job IDs are maintained in the normal done-state JSON.
+
+This schedule uses file modification time and file size to detect changes. **Update jobs files atomically** (`write temporary JSON -> os.replace`) so the manager reliably detects new work. Progress that depends exclusively on external databases without a changing jobs file needs a future database/event-driven scheduler.
+
 ## Blind real-job deployment gate
 
 The code-generation LLM may be shown detailed failures from **BRD-authored examples** and may retry up to `MAX_ATTEMPTS` times. The N labeled real jobs are an independent **blind deployment gate**: after a GPT-generated candidate passes BRD examples, Python evaluates it against those jobs. A failed N-job check immediately blocks that BRD hash and requests human review; it does **not** send real-job inputs, expected outputs, actual outputs, or failing-case feedback to GPT, and it does **not** trigger another GPT generation attempt. Human-visible logs may include failure details.
@@ -112,7 +132,7 @@ A normal BRD content change invalidates the active in-memory function, clears pr
 
 **An unexpected worker-process exit** is detected by `JobManager`. The manager conservatively blocks the last launched BRD hash and quarantines its last reported active function when one is known. A nonzero worker exit is not necessarily caused by the generated function; it still needs human diagnosis. Intentional stop requests and deleted BRDs do not trigger this block.
 
-BRD/function-related human-review blocks are stored in `saved_functions/registry.json` under `runtime_block`, so restarting the manager does not silently allow another attempt for the same BRD content. After investigating, edit the BRD to create a new hash (which triggers fresh validation), or explicitly clear the current hash's `runtime_block` in the registry while the manager is stopped after approving an alternative implementation. Editing only the generated/handcrafted Python file does not clear the persistent block. **GPT configuration/policy errors are different:** they cause an in-memory human-escalation block only. Fix credentials, Azure deployment or policy settings, then restart the manager to resume processing without editing every BRD. Legacy saved blocks whose `origin` is `gpt_service_configuration` are ignored on restart (retained for audit); they can be superseded by a genuine function/BRD failure. If credentials are supplied as OS environment variables, those take precedence over `.env`.
+BRD/function-related human-review blocks are stored in `saved_functions/registry.json` under `runtime_block`, so restarting the manager does not silently allow another attempt for the same BRD content. An investigator can update the BRD or use the explicit human-approved handcrafted recovery command described below. Merely adding a handwritten `.py` file does not unblock a failed BRD. **GPT configuration/policy errors are different:** they cause an in-memory human-escalation block only. Fix credentials, Azure deployment or policy settings, then restart the manager to resume processing without editing every BRD. Legacy saved blocks whose `origin` is `gpt_service_configuration` are ignored on restart (retained for audit); they can be superseded by a genuine function/BRD failure. If credentials are supplied as OS environment variables, those take precedence over `.env`.
 
 **Function execution watchdog:** The manager now records when a BRD example, deployment-validation check, live job, or generated-code load executes function code. If cumulative **non-GPT computation time** exceeds `FUNCTION_CALL_TIMEOUT_SECONDS` (default **120 seconds**, set to `0` to disable), JobManager terminates the worker, blocks the BRD hash, and escalates for human review. Time spent inside the approved `my_tools.ask_gpt()` wrapper is **paused and excluded**, without erasing computation time accrued before the call. Code-generation API calls and ordinary polling are also excluded. This is a reliability watchdog, **not a security sandbox**.
 
