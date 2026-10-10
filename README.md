@@ -44,9 +44,11 @@ requirements.txt                   Python dependencies
 
 There is no separate `tests/` directory or GitHub Actions regression-test workflow.
 
-## BRD format
+## BRD format (illustrative word-count example)
 
-A BRD must contain these underlined sections. Their names are matched case-insensitively; Python parses the JSON and the standalone directives, rather than accepting interpretations from the code-generating LLM.
+The examples below come from the toy `BRD_word_count.txt` and illustrate how to format a BRD; they do **not** prescribe word-count-specific input fields, output types, job fields, or the number of validation jobs for other BRDs. Each BRD defines those details according to its own requirements.
+
+The underlined section headings and machine-readable structure are required. Python matches the headings case-insensitively and parses the JSON and standalone directives directly, rather than accepting interpretations from the code-generating LLM.
 
 **FUNCTION INPUT/OUTPUT CONTRACT:** ordered input array and output contract:
 
