@@ -569,12 +569,15 @@ class JobManager:
             pass
 
     def _check_function_timeouts(self) -> None:
-        """Enforce cumulative computation AND total invocation wall-time limits.
+        """Enforce execution budgets, including legacy/mismatched worker protocols.
 
-        Request cancellation first. A generated GPT wrapper observes the request
-        before subsequent calls and after a current API response. Kill a stuck
-        worker after a bounded grace period, waiting longer if it currently holds
-        a GPT slot to reduce the chance of stranding a shared semaphore permit.
+        The worker exclusively owns function_call::<BRD>; the manager owns
+        cancel::<BRD>. A missing invocation ID is a protocol violation, NOT
+        permission for a stuck worker to run without a watchdog.
+
+        Once a timeout is observed, keep its failure record until cleanup even
+        if the worker finishes that invocation or starts a newer one. A late
+        cancellation must not target the newer invocation.
         """
         compute_limit = FUNCTION_CALL_TIMEOUT_SECONDS
         wall_limit = FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS
@@ -594,88 +597,102 @@ class JobManager:
             try:
                 key = f"function_call::{brd.name}"
                 state = shared.get(key)
-                if not isinstance(state, dict) or state.get("pid") != proc.pid:
-                    continue
-                paused = bool(state.get("paused", False))
-                compute_elapsed = now - float(state.get("started_monotonic", now))
-                wall_elapsed = now - float(
-                    state.get("wall_started_monotonic", state.get("started_monotonic", now))
-                )
-                exceeded = (
-                    (compute_limit > 0 and not paused and compute_elapsed > compute_limit)
-                    or (wall_limit > 0 and wall_elapsed > wall_limit)
-                )
+                valid_state = isinstance(state, dict) and state.get("pid") == proc.pid
                 failure = self._timed_out_pids.get(proc.pid)
+                if not valid_state and failure is None:
+                    continue
+
                 if failure is None:
+                    paused = bool(state.get("paused", False))
+                    compute_elapsed = now - float(state.get("started_monotonic", now))
+                    wall_elapsed = now - float(
+                        state.get("wall_started_monotonic", state.get("started_monotonic", now))
+                    )
+                    exceeded = (
+                        (compute_limit > 0 and not paused and compute_elapsed > compute_limit)
+                        or (wall_limit > 0 and wall_elapsed > wall_limit)
+                    )
                     if not exceeded:
                         continue
+
                     kind = "total_wall" if wall_limit > 0 and wall_elapsed > wall_limit else "computation"
                     elapsed = wall_elapsed if kind == "total_wall" else compute_elapsed
                     limit = wall_limit if kind == "total_wall" else compute_limit
+                    invocation_id = state.get("invocation_id")
+                    # Re-read to avoid sending a cancellation to a newer call.
+                    latest = shared.get(key)
+                    if (not isinstance(latest, dict) or latest.get("pid") != proc.pid
+                            or latest.get("invocation_id") != invocation_id):
+                        continue
+
+                    legacy = not bool(invocation_id)
                     reason = (
                         f"Function exceeded {kind} budget: {elapsed:.1f}s elapsed "
                         f"(limit {limit:.1f}s, phase={state.get('phase', 'function_call')})"
                     )
-                    # The worker alone writes function_call::<BRD>. The manager
-                    # writes cancel::<BRD> with a per-invocation token instead;
-                    # no read-modify-write race can reset gpt_slot_held.
-                    invocation_id = state.get("invocation_id")
-                    if not invocation_id:
-                        self.logger.warning("Missing invocation ID for BRD %s; cannot cancel safely", brd.name)
-                        continue
-                    # A finished or replaced invocation should not be cancelled.
-                    latest = shared.get(key)
-                    if not isinstance(latest, dict) or latest.get("pid") != proc.pid or latest.get("invocation_id") != invocation_id:
-                        continue
+                    if legacy:
+                        reason += "; incompatible worker watchdog protocol (missing invocation ID)"
                     failure = {
                         "phase": str(state.get("phase", "function_call")),
                         "elapsed": elapsed, "limit": limit,
                         "kind": kind, "reason": reason, "requested_at": now,
-                        "invocation_id": invocation_id,
+                        "invocation_id": invocation_id, "legacy_protocol": legacy,
                     }
                     self._timed_out_pids[proc.pid] = failure
-                    shared[f"cancel::{brd.name}"] = {
-                        "pid": proc.pid, "invocation_id": invocation_id, "reason": reason,
-                    }
-                    self.logger.error(
-                        "ESCALATE TO HUMAN: BRD %s worker %s %s. "
-                        "Requesting cooperative cancellation.", brd.name, proc.pid, reason,
-                    )
+                    if legacy:
+                        # No reliable invocation token: cooperative cancellation
+                        # is impossible. Escalate by PID, allowing a conservative
+                        # grace period in case the older worker holds a GPT slot.
+                        self.logger.error(
+                            "ESCALATE TO HUMAN: BRD %s worker %s missing invocation ID; "
+                            "will force-stop after bounded compatibility grace. %s",
+                            brd.name, proc.pid, reason,
+                        )
+                    else:
+                        shared[f"cancel::{brd.name}"] = {
+                            "pid": proc.pid, "invocation_id": invocation_id, "reason": reason,
+                        }
+                        self.logger.error(
+                            "ESCALATE TO HUMAN: BRD %s worker %s %s. "
+                            "Requesting cooperative cancellation.", brd.name, proc.pid, reason,
+                        )
                     continue
 
-                # Both keys have a single owner. Never write back the worker's
-                # timing/slot marker from the manager's stale read.
-                if failure.get("invocation_id") != state.get("invocation_id"):
-                    self.logger.warning(
-                        "BRD %s advanced invocation after cancellation request; "
-                        "discarding stale cancellation for %s", brd.name, failure.get("invocation_id"),
+                # A timeout has already been confirmed for this worker.
+                # NEVER drop it solely because the original invocation ended.
+                # In particular, do not cancel a subsequent invocation.
+                advanced = (
+                    valid_state
+                    and failure.get("invocation_id") != state.get("invocation_id")
+                )
+                if advanced and not failure.get("advanced_noted"):
+                    self.logger.error(
+                        "ESCALATE TO HUMAN: BRD %s advanced past timed-out invocation %s. "
+                        "The violation remains recorded; stopping worker for review.",
+                        brd.name, failure.get("invocation_id"),
                     )
+                    failure["advanced_noted"] = True
                     cancel_key = f"cancel::{brd.name}"
                     current_cancel = shared.get(cancel_key)
-                    if isinstance(current_cancel, dict) and current_cancel.get("pid") == proc.pid and current_cancel.get("invocation_id") == failure.get("invocation_id"):
+                    if (isinstance(current_cancel, dict)
+                            and current_cancel.get("pid") == proc.pid
+                            and current_cancel.get("invocation_id") == failure.get("invocation_id")):
                         shared.pop(cancel_key, None)
-                    self._timed_out_pids.pop(proc.pid, None)
+
+                elapsed_since_cancel = now - float(failure.get("requested_at", now))
+                grace = FUNCTION_CANCELLATION_GRACE_SECONDS
+                # Incompatible/absent/advanced status is not sufficient to
+                # prove no GPT permit is held. Choose the longer grace.
+                slot_uncertain = bool(failure.get("legacy_protocol")) or not valid_state or advanced
+                if slot_uncertain or state.get("gpt_slot_held", False):
+                    grace = max(grace, brd_processor.GPT_REQUEST_TIMEOUT_SECONDS + 5.0)
+                if elapsed_since_cancel < grace:
                     continue
 
-                # The worker has been told to stop. Once it returns from a GPT
-                # call it can release the semaphore before honoring cancellation.
-                elapsed_since_cancel = now - float(failure.get("requested_at", now))
-                wait_grace = FUNCTION_CANCELLATION_GRACE_SECONDS
-                if state.get("gpt_slot_held", False):
-                    # An HTTP request can take up to the configured per-request
-                    # deadline. Force kill only after a bounded opportunity to
-                    # release the GPT semaphore. This is best effort, not a broker.
-                    wait_grace = max(
-                        wait_grace,
-                        brd_processor.GPT_REQUEST_TIMEOUT_SECONDS + 5.0,
-                    )
-                if elapsed_since_cancel < wait_grace:
-                    continue
                 self.logger.error(
-                    "ESCALATE TO HUMAN: BRD %s did not honor cancellation after %.1fs; "
-                    "force-terminating PID %s (GPT slot held=%s).",
-                    brd.name, elapsed_since_cancel, proc.pid,
-                    bool(state.get("gpt_slot_held", False)),
+                    "ESCALATE TO HUMAN: BRD %s has a confirmed watchdog violation "
+                    "(%s); force-terminating PID %s after %.1fs grace.",
+                    brd.name, failure.get("reason"), proc.pid, elapsed_since_cancel,
                 )
                 proc.terminate()
                 proc.join(timeout=2)

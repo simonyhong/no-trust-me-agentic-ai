@@ -40,6 +40,9 @@ MAX_ATTEMPTS = 10
 MAX_JOBS_PER_WORKER_SESSION = max(1, int(os.getenv("MAX_JOBS_PER_WORKER_SESSION", "25")))
 # 0 disables the per-invocation GPT request count cap (not recommended).
 MAX_GPT_CALLS_PER_FUNCTION = max(0, int(os.getenv("MAX_GPT_CALLS_PER_FUNCTION", "5")))
+# Local final-result validation uses the same limits as the manager watchdog.
+FUNCTION_CALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_CALL_TIMEOUT_SECONDS", "120"))
+FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS", "300"))
 _PERSIST_EVERY = 50
 LOG = logging.getLogger("brd_processor")
 
@@ -1315,6 +1318,25 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
     previous_issue = _gpt_tool_issue_during_call
     previous_count = _gpt_calls_in_monitored_call
     previous_limit_issue = _function_limit_issue_during_call
+    wall_started_locally = time.monotonic()
+
+    def _check_completion_budget() -> None:
+        """Validate even when a function finishes between supervisor polls."""
+        global _function_limit_issue_during_call
+        if mark is not None:
+            reason = mark("check_budget", phase)
+            if reason:
+                _function_limit_issue_during_call = str(reason)
+        # A local wall-clock fallback also works if a shared marker was lost.
+        if (FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS > 0
+                and time.monotonic() - wall_started_locally > FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS):
+            _function_limit_issue_during_call = (
+                f"Function exceeded total_wall budget before return "
+                f"(limit {FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS:g}s)"
+            )
+        if _function_limit_issue_during_call:
+            raise FunctionExecutionLimitExceeded(_function_limit_issue_during_call)
+
     if mark is not None:
         mark("start", phase)
     _monitored_phase = phase
@@ -1325,8 +1347,10 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
-            if _function_limit_issue_during_call:
-                raise FunctionExecutionLimitExceeded(_function_limit_issue_during_call) from exc
+            try:
+                _check_completion_budget()
+            except FunctionExecutionLimitExceeded as budget_exc:
+                raise budget_exc from exc
             # A generated function may have caught a tool error, then failed
             # for another reason. Preserve the true tool-failure classification.
             if _gpt_tool_issue_during_call is not None:
@@ -1336,6 +1360,7 @@ def _invoke_monitored(func, *args, phase="function_call", **kwargs):
                 if kind == "configuration":
                     raise GPTServiceConfigurationError(detail) from exc
             raise
+        _check_completion_budget()
         if mark is not None:
             cancelled = mark("check_cancel", phase)
             if cancelled:
@@ -2105,6 +2130,21 @@ def process_single_brd_standalone(
             state = shared.get(key)
             if not isinstance(state, dict) or state.get("pid") != os.getpid():
                 return
+            if event == "check_budget":
+                # A worker-side check catches returns between manager polling
+                # cycles, before the result can be logged or marked done.
+                compute_elapsed = (
+                    float(state.get("elapsed_compute", 0.0)) if state.get("paused", False)
+                    else now - float(state.get("started_monotonic", now))
+                )
+                wall_elapsed = now - float(state.get("wall_started_monotonic", now))
+                if FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS > 0 and wall_elapsed > FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS:
+                    return (f"Function exceeded total_wall budget: {wall_elapsed:.2f}s "
+                            f"(limit {FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS:g}s)")
+                if FUNCTION_CALL_TIMEOUT_SECONDS > 0 and compute_elapsed > FUNCTION_CALL_TIMEOUT_SECONDS:
+                    return (f"Function exceeded computation budget: {compute_elapsed:.2f}s "
+                            f"(limit {FUNCTION_CALL_TIMEOUT_SECONDS:g}s)")
+                return None
             if event == "check_cancel":
                 # Cancellation is stored separately by the manager. It must not
                 # write the worker-owned function_call record, which includes
