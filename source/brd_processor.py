@@ -363,7 +363,7 @@ def _static_safety_check(code: str) -> None:
 
 
 def _extract_section_body(brd_text: str, heading: str) -> str:
-    """Return a rigid BRD section body by matching a true underlined heading."""
+    """Find an exact required heading; numbering and underline are optional."""
     lines = brd_text.splitlines()
     wanted = heading.strip().upper()
 
@@ -374,27 +374,14 @@ def _extract_section_body(brd_text: str, heading: str) -> str:
             text = match.group(1).strip()
         return text.rstrip(":").strip().upper()
 
-    def _has_heading_underline(index: int) -> bool:
-        next_index = index + 1
-        while next_index < len(lines) and not lines[next_index].strip():
-            next_index += 1
-        return next_index < len(lines) and bool(re.fullmatch(r"[-=]{3,}", lines[next_index].strip()))
-
-    def _is_numbered_section_heading(index: int) -> bool:
-        return bool(re.fullmatch(r"\d+\.\s+\S.*", lines[index].strip())) and _has_heading_underline(index)
-
-    start = None
-    for i, line in enumerate(lines):
-        if _normalized_heading(line) == wanted and _has_heading_underline(i):
-            start = i + 1
-            break
+    start = next((i + 1 for i, line in enumerate(lines) if _normalized_heading(line) == wanted), None)
     if start is None:
-        raise ValueError(f"BRD is missing required underlined section: {heading}")
+        raise ValueError(f"BRD is missing required section: {heading}")
 
     end = len(lines)
     for i in range(start, len(lines)):
         stripped = lines[i].strip()
-        if "TECHNICAL DESCRIPTIONS" in stripped.upper() or _is_numbered_section_heading(i):
+        if "TECHNICAL DESCRIPTIONS" in stripped.upper() or re.fullmatch(r"\d+\.\s+\S.*", stripped):
             end = i
             break
     return "\n".join(lines[start:end])

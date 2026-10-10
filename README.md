@@ -12,6 +12,8 @@ The key principle is simple: **The LLM writes the code, but Python—not the LLM
 
 Once validated, the function is saved and reused to process future jobs without repeatedly calling the code-generating LLM. 
 
+**Architecture and BRD-format slides:** [No_Trust_Me_Agentic_AI.pptx](No_Trust_Me_Agentic_AI.pptx)
+
 ## How it works
 
 `job_manager.py` discovers `documents/BRD_*.txt`, starts bounded-concurrency workers, and manages scheduling, logging, cancellation and watchdogs. `source/brd_processor.py` parses each BRD, selects an implementation, independently validates it, then processes its jobs from the matching `BRD_*_jobs.json` file.
@@ -36,7 +38,7 @@ source/brd_processor.py            BRD worker, code generator, validation and jo
 source/__init__.py                 Python package marker
 documents/BRD_word_count.txt       Sanitized BRD example, including Python-parsed test examples
 documents/BRD_word_count_jobs.json Sanitized labeled jobs for the N-job gate
-docs/No_Trust_Me_Agentic_AI.pptx   Project architecture presentation
+No_Trust_Me_Agentic_AI.pptx        Project architecture presentation (repository root)
 saved_functions/                   Runtime implementation cache and registry
 .env.example                       Environment configuration template
 requirements.txt                   Python dependencies
@@ -48,21 +50,21 @@ There is no separate `tests/` directory or GitHub Actions regression-test workfl
 
 The examples below come from the toy `BRD_word_count.txt` and illustrate how to format a BRD; they do **not** prescribe word-count-specific input fields, output types, job fields, or the number of validation jobs for other BRDs. Each BRD defines those details according to its own requirements.
 
-The underlined section headings and machine-readable structure are required. Python matches the headings case-insensitively and parses the JSON and standalone directives directly, rather than accepting interpretations from the code-generating LLM.
+Only the three highlighted section titles shown in the presentation are mandatory: `FUNCTION INPUT/OUTPUT CONTRACT`, `TEST EXAMPLES & EXPECTED RESULTS`, and `JOBS DATA STRUCTURE`, together with their required machine-readable JSON or standalone directives. Section numbers, underlines, and all other BRD headings are **optional** and may be used for readability. Python matches the three required titles case-insensitively and parses their data directly, rather than asking the LLM to interpret it.
 
-**FUNCTION INPUT/OUTPUT CONTRACT:** ordered input array and output contract:
+**FUNCTION INPUT/OUTPUT CONTRACT:** example JSON showing the required `input` and `output` structure:
 
 ```json
 {"input": [{"name": "text", "type": "string"}], "output": {"type": "integer"}}
 ```
 
-**TEST EXAMPLES & EXPECTED RESULTS:** one JSON array of user-authored examples:
+**TEST EXAMPLES & EXPECTED RESULTS:** example JSON array of user-authored tests:
 
 ```json
 [{"input": "Hello world", "output": 2}, {"input": "", "output": 0}]
 ```
 
-**JOBS DATA STRUCTURE:** describe the job records and provide exactly one line of each directive:
+**JOBS DATA STRUCTURE:** a job description is optional, but one standalone line for each of these directives is required:
 
 ```text
 ID_FIELD=incident_id
