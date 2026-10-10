@@ -39,6 +39,7 @@ class JobManager:
         self._inflight_brds: set[pathlib.Path] = set()
         self._pid_to_brd: dict[int, pathlib.Path] = {}
         self._pid_to_brd_hash: dict[int, str] = {}
+        self._pid_to_launch_fp: dict[int, tuple] = {}
         self._pid_to_log: dict[int, tuple] = {}
         self._timed_out_pids: dict[int, dict] = {}
         self._blocked_log_ts: dict[str, float] = {}
@@ -316,8 +317,8 @@ class JobManager:
         served = self._last_dispatched_sequence
         return sorted(brds, key=lambda brd: (served.get(brd.name, -1), brd.name))
 
-    def _consider_worker_yield(self, brd: pathlib.Path, proc_pid: int) -> None:
-        """Capture clean worker yield before freeing its concurrency slot."""
+    def _consider_worker_yield(self, brd: pathlib.Path, proc_pid: int, launch_fp: tuple | None) -> None:
+        """Snooze using pre-launch BRD/jobs stamps, never an unseen jobs update."""
         reason = None
         try:
             shared = self.shared_data.get("shared_dict")
@@ -327,7 +328,14 @@ class JobManager:
                 shared.pop(f"worker_yield::{brd.name}", None)
         except (OSError, EOFError, BrokenPipeError):
             pass
-        self._snoozed_fingerprints[brd.name] = self._work_fingerprint(brd)
+        exit_fp = self._work_fingerprint(brd)
+        # The worker can only observe BRD/jobs updates after its launch. Using an
+        # exit-time stamp for those files can silently swallow an unobserved job.
+        # The done file is worker-written, so retain its final stamp instead.
+        if launch_fp is None:
+            self._snoozed_fingerprints.pop(brd.name, None)
+        else:
+            self._snoozed_fingerprints[brd.name] = (launch_fp[0], launch_fp[1], exit_fp[2])
         if reason == "blocked_configuration":
             self._session_blocks.add(brd.name)
         elif reason == "service_retry":
@@ -454,7 +462,9 @@ class JobManager:
                         )
 
                         try:
+                            launch_fp = self._work_fingerprint(brd)
                             proc.start()
+                            self._pid_to_launch_fp[proc.pid] = launch_fp
                             self.active_processes.append(proc)
                             self._inflight_brds.add(brd)
                             self._pid_to_brd[proc.pid] = brd
@@ -762,9 +772,10 @@ class JobManager:
             # Mark BRD available; clean exits may intentionally yield an idle slot.
             brd_done = self._pid_to_brd.pop(proc.pid, None)
             launched_hash = self._pid_to_brd_hash.pop(proc.pid, None)
+            launch_fp = self._pid_to_launch_fp.pop(proc.pid, None)
             watchdog_failure = self._timed_out_pids.pop(proc.pid, None)
             if brd_done is not None and exit_code == 0 and watchdog_failure is None:
-                self._consider_worker_yield(brd_done, proc.pid)
+                self._consider_worker_yield(brd_done, proc.pid, launch_fp)
             worker_log = self._pid_to_log.pop(proc.pid, None)
             if brd_done is not None:
                 self._inflight_brds.discard(brd_done)
@@ -961,6 +972,7 @@ class JobManager:
                 self._inflight_brds.discard(target_brd)
                 self._pid_to_brd.pop(target_proc.pid, None)
                 self._pid_to_brd_hash.pop(target_proc.pid, None)
+                self._pid_to_launch_fp.pop(target_proc.pid, None)
                 self._stop_worker_log(self._pid_to_log.pop(target_proc.pid, None))
                 self._timed_out_pids.pop(target_proc.pid, None)
                 try:
@@ -993,6 +1005,7 @@ class JobManager:
         self._inflight_brds.discard(target_brd)
         self._pid_to_brd.pop(target_proc.pid, None)
         self._pid_to_brd_hash.pop(target_proc.pid, None)
+        self._pid_to_launch_fp.pop(target_proc.pid, None)
         self._stop_worker_log(self._pid_to_log.pop(target_proc.pid, None))
         self._timed_out_pids.pop(target_proc.pid, None)
         return False
@@ -1079,6 +1092,7 @@ class JobManager:
                 pass
             brd_done = self._pid_to_brd.pop(p.pid, None)
             self._pid_to_brd_hash.pop(p.pid, None)
+            self._pid_to_launch_fp.pop(p.pid, None)
             self._timed_out_pids.pop(p.pid, None)
             self._stop_worker_log(self._pid_to_log.pop(p.pid, None))
             if brd_done is not None:

@@ -2401,8 +2401,7 @@ def process_single_brd_standalone(
                         )
                     except Exception as exc:
                         # Do not call the implementation-generating LLM while deployment is impossible.
-                        # We intentionally keep the worker alive and recheck the jobs file; exiting here
-                        # would make the current JobManager immediately restart the worker in a loop.
+                        # Yield while waiting for valid input; JobManager relaunches on file changes.
                         if now >= next_deployment_preflight_warn_ts:
                             module_logger.warning(
                                 "Deployment preflight blocked for %s: %s. No function will be generated/deployed "
@@ -2699,13 +2698,6 @@ def process_single_brd_standalone(
                 module_logger.exception("Loop error for %s: %s", brd_path.name, exc)
                 _yield_slot("wait_for_brd")
                 break
-                cached_func = None
-                cached_contract = None
-                cached_brd_tests = None
-                cached_n_items_to_pass = None
-                cached_id_field = None
-                cached_expected_field = None
-                time.sleep(check_interval)
 
     except Exception as exc:
         module_logger.exception("Fatal error in perpetual processing for %s: %s", brd_path.name, exc)
