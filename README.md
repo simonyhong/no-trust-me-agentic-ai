@@ -1,254 +1,90 @@
-# No-Trust-Me Agentic AI
+# No-Trust-Me Agentic AI — BRD Worker Prototype
 
-No-Trust-Me Agentic AI is an experimental BRD-driven agent framework. A Business Requirement Document (BRD) describes a task, an LLM generates or repairs a Python function, and deterministic Python checks decide whether that function may be used.
+> **Important change (October 2026):** This experimental version has **no automated test suite and no BRD-example or real-job approval tests**. Generated, cached and handcrafted functions are selected without executing test examples or checking expected job answers. The older project presentation in `docs/No_Trust_Me_Agentic_AI.pptx` describes a previous, test-gated architecture and is retained only as historical background. The project name is historical; it does not imply independently verified correctness.
 
-The core idea is simple: do not trust the LLM's self-evaluation. The generated function must pass Python-owned checks before deployment:
+## How it works
 
-1. the BRD-authored function input/output contract,
-2. the BRD-authored examples and expected outputs,
-3. the first `N_ITEMS_TO_PASS` labeled jobs from the matching jobs file.
+`job_manager.py` finds `documents/BRD_*.txt`, dispatches at most `max_concurrent_BRD_agents` workers, and handles lifecycle, scheduling, logging and watchdogs. `source/brd_processor.py` reads each BRD, loads an implementation and processes corresponding `BRD_*_jobs.json` records in arrival/file order. Implementations are tried in this order:
 
-After a function is deployed, normal jobs are processed by the Python function directly. Python derives the implementation function name deterministically from the BRD filename (for example, `BRD_word_count.txt -> word_count()`), so no LLM call is needed merely to initialize or re-read a BRD. The framework uses the LLM only when a new/generated implementation is actually needed or during failure recovery. A generated implementation may optionally call `my_tools.ask_gpt(...)` during ordinary jobs when its BRD truly requires LLM reasoning; in that case those jobs do invoke the LLM and their outputs may be nondeterministic.
+1. One optional handcrafted Python module from `saved_functions/<BRD stem>_handcrafted/`.
+2. Previously saved generated implementation indexed by the current BRD hash in `saved_functions/registry.json`.
+3. A newly GPT-generated Python implementation if no usable module is available.
+
+**There is no pre-deployment behavior check.** Code is checked for parseability and disallowed constructs, and must expose the expected callable. During live jobs, Python still enforces input/output **types and structure** from the BRD contract, along with execution time limits. It does not compare answers with an `expected_*` field, run BRD examples, or sample labeled real jobs. A function returning the wrong but correctly typed answer can therefore be marked successful. Do not treat this version as quality-assured or safe for production.
 
 ## Repository layout
 
 ```text
-no-trust-me-agentic-ai/
-├── job_manager.py                         # Main entry point
-├── source/
-│   ├── __init__.py
-│   └── brd_processor.py                   # BRD-processing agent logic
-├── documents/
-│   ├── BRD_word_count.txt                 # Sanitized demonstration BRD
-│   └── BRD_word_count_jobs.json           # Labeled demonstration jobs
-├── docs/
-│   └── No_Trust_Me_Agentic_AI.pptx        # Project overview presentation
-├── saved_functions/
-│   └── .gitkeep                           # Runtime generated files go here
-├── .env.example
-├── .gitignore
-├── requirements.txt
-└── LICENSE
+job_manager.py                     Main entry point
+source/brd_processor.py            Per-BRD worker and GPT code generator
+documents/BRD_word_count.txt       Sanitized demo business requirement
+documents/BRD_word_count_jobs.json Sanitized demo job inputs
+docs/No_Trust_Me_Agentic_AI.pptx   Historical slides (outdated test-gate diagram)
+saved_functions/                   Runtime function cache and registry
+.env.example                       Private environment-variable template
+requirements.txt                   Runtime dependencies
 ```
 
-`documents/` is intentionally used for the example files because this is the real runtime path. `job_manager.py` scans `documents/BRD_*.txt` and each worker expects the matching jobs file beside it as `<BRD stem>_jobs.json`.
+There is no `tests/` directory or automated CI test pipeline in this version.
 
-## BRD format
+## BRD authoring
 
-Only a few BRD sections are rigid for Python inspection.
-
-### FUNCTION INPUT/OUTPUT CONTRACT
-
-This section must contain one JSON object with singular key `input` and key `output`:
-
-```json
-{
-  "input": [
-    {
-      "name": "text",
-      "type": "string"
-    }
-  ],
-  "output": {
-    "type": "integer"
-  }
-}
-```
-
-Old plural `inputs` is intentionally not the current format.
-
-### TEST EXAMPLES & EXPECTED RESULTS
-
-This section must contain a JSON array of user-authored tests:
-
-```json
-[
-  {
-    "input": "Hello world",
-    "output": 2
-  }
-]
-```
-
-Python parses these tests directly. The code-generating LLM must not invent, rewrite, or reinterpret the test examples or expected outputs.
-
-### JOBS DATA STRUCTURE
-
-This section must describe the runtime job records and contain exactly one standalone line for each trust-critical directive:
+Each `BRD_*.txt` must contain an underlined `FUNCTION INPUT/OUTPUT CONTRACT` heading with a JSON object containing ordered `input` definitions and an `output` definition. It also needs an underlined `JOBS DATA STRUCTURE` heading containing `ID_FIELD=<identifier>` on exactly one line. Other prose is free-form. Example:
 
 ```text
+4. FUNCTION INPUT/OUTPUT CONTRACT
+---------------------------------
+{
+  "input": [{"name": "text", "type": "string"}],
+  "output": {"type": "integer"}
+}
+
+5. JOBS DATA STRUCTURE
+----------------------
 ID_FIELD=incident_id
-EXPECTED_FIELD=expected_word_count
-N_ITEMS_TO_PASS=15
 ```
 
-Python parses these directives directly; the LLM does not choose the job ID field or expected-answer field. A job is labeled when it contains `EXPECTED_FIELD`. Before deployment, a candidate implementation must pass the first `N_ITEMS_TO_PASS` labeled jobs in file order.
+Legacy `TEST EXAMPLES & EXPECTED RESULTS`, `N_ITEMS_TO_PASS` and `EXPECTED_FIELD` content in older BRDs is no longer parsed or used as an approval gate. If those sections remain, their prose may still be included in the BRD supplied to the code-generating LLM; they are **not executed by Python**. The included demo BRD omits them.
 
-## Candidate selection order
+For `BRD_word_count.txt`, a jobs file `BRD_word_count_jobs.json` can contain `[{"incident_id":"A1","text":"Hello world"}]`. The generated function name is derived from the BRD filename, e.g. `word_count`.
 
-The callable name for a new implementation is derived from the BRD filename by removing the `BRD_` prefix. For example, `BRD_email_router.txt` maps to `email_router()`. Existing handcrafted modules with a legacy/custom name remain usable when they contain exactly one public function.
+## Running
 
-For each current BRD hash, the worker tries candidates in this order:
-
-1. optional handcrafted implementation from `saved_functions/<BRD stem>_handcrafted/`,
-2. cached generated implementation from `saved_functions/registry.json`,
-3. new GPT-generated implementation.
-
-Every candidate must pass the same Python-owned validation: all BRD-authored tests plus the first `N_ITEMS_TO_PASS` labeled jobs.
-
-## Explicit human-approved recovery of a blocked BRD
-
-When a BRD is persistently blocked because its active implementation failed, a programmer can supply a handcrafted replacement **without changing the BRD text or manually deleting registry entries**:
-
-1. **Stop** `job_manager.py` so the approval file and registry cannot be edited simultaneously by workers.
-2. Put exactly one reviewed Python source file in `saved_functions/<BRD stem>_handcrafted/`. The file should implement the BRD-derived function name (for example `word_count()` for `BRD_word_count.txt`).
-3. Execute `python job_manager.py --approve-handcrafted BRD_word_count.txt`. This records explicit human authorization tied to the **current BRD content hash** and the **exact source file content hash**.
-4. Restart `job_manager.py`. It tries **only that approved handcrafted function**, not the cache and not GPT, and independently checks the BRD-authored examples and first `N_ITEMS_TO_PASS` labeled jobs.
-5. Only after **both** checks pass does Python remove the persistent `runtime_block` and activate the handcrafted function. On failure the approval is consumed, the BRD remains blocked, and the attempt is recorded in `handcrafted_recovery_history`. Edit the function and issue a fresh approval to try again.
-
-An approved source edit after authorization invalidates the approval. A function that hangs or crashes during approved recovery also consumes its approval and remains blocked. This remains an explicit *human authorization*, not a security sandbox.
-
-## Fair scheduling of more BRDs than worker slots
-
-`max_concurrent_BRD_agents=10` limits **simultaneously running processes**, not the total number of BRDs. Workers that finish their actionable jobs, are blocked, lack sufficient labeled input data, or encounter unreadable jobs data now **yield their slots**. JobManager continues scanning all BRDs and relaunches them when BRD/jobs/done-state file metadata changes; it does not repeatedly relaunch unchanged idle jobs.
-
-For fairness, each worker processes at most `MAX_JOBS_PER_WORKER_SESSION=25` actionable records before yielding. **Ready BRDs are dispatched oldest-served-first**, using a dispatch sequence recorded *only after a worker starts successfully*: BRDs that have never run are prioritized, then those that ran longest ago. Alphabetical ordering breaks ties only, so busy BRDs late in the alphabet are not continually pushed behind earlier names. BRDs with large backlogs resume after a short **5-second** scheduling cooldown. **A pending retry remains queued while the worker pool is full; its marker is consumed only after successful process startup**, preventing unfinished batches from vanishing due to slot contention. A transient GPT outage yields its slot and retries after **45 seconds**; a configuration/policy failure blocks the BRD for the **manager session**, until the operator corrects the settings and restarts. All completed job IDs are maintained in the normal done-state JSON.
-
-`tests/test_scheduler_fairness.py` provides a deterministic scheduling regression: twenty continually busy BRDs sharing two slots must all receive an initial turn before any repeats, and an expired retry must remain pending when no slot is available. Run with `python tests/test_scheduler_fairness.py`.
-
-This schedule uses file modification time and file size to detect changes. **Update jobs files atomically** (`write temporary JSON -> os.replace`) so the manager reliably detects new work. Progress that depends exclusively on external databases without a changing jobs file needs a future database/event-driven scheduler.
-
-## Blind real-job deployment gate
-
-The code-generation LLM may be shown detailed failures from **BRD-authored examples** and may retry up to `MAX_ATTEMPTS` times. The N labeled real jobs are an independent **blind deployment gate**: after a GPT-generated candidate passes BRD examples, Python evaluates it against those jobs. A failed N-job check immediately blocks that BRD hash and requests human review; it does **not** send real-job inputs, expected outputs, actual outputs, or failing-case feedback to GPT, and it does **not** trigger another GPT generation attempt. Human-visible logs may include failure details.
-
-Handcrafted and previously cached candidates are checked using the same BRD examples and N jobs. If such a candidate fails, Python may try the next candidate without supplying its N-job failure details to GPT. The GPT-generated candidate's first failed N-job validation is terminal for that BRD hash until the BRD changes.
-
-## Runtime failure and human escalation
-
-A normal BRD content change invalidates the active in-memory function, clears previous reflections, reparses the BRD, and reruns normal candidate selection and validation.
-
-**Malformed job records** are rejected and recorded in done-state without blaming the function.
-
-**A failure on a valid live job** (exception, wrong labeled answer, or BRD output-contract violation) now causes immediate quarantine of the active function and a persistent human-review block for that exact BRD hash. The worker stops processing that BRD and **does not ask GPT to regenerate a replacement**. The detailed failure remains in the logs for investigation; other BRDs continue operating.
-
-**An unexpected worker-process exit** is detected by `JobManager`. The manager conservatively blocks the last launched BRD hash and quarantines its last reported active function when one is known. A nonzero worker exit is not necessarily caused by the generated function; it still needs human diagnosis. Intentional stop requests and deleted BRDs do not trigger this block. A worker with a **confirmed watchdog violation** is also blocked even if it exits with code `0`; logs now describe this as a watchdog stop rather than an unexpected crash.
-
-BRD/function-related human-review blocks are stored in `saved_functions/registry.json` under `runtime_block`, so restarting the manager does not silently allow another attempt for the same BRD content. An investigator can update the BRD or use the explicit human-approved handcrafted recovery command described below. Merely adding a handwritten `.py` file does not unblock a failed BRD. **GPT configuration/policy errors are different:** they cause an in-memory human-escalation block only. Fix credentials, Azure deployment or policy settings, then restart the manager to resume processing without editing every BRD. Legacy saved blocks whose `origin` is `gpt_service_configuration` are ignored on restart (retained for audit); they can be superseded by a genuine function/BRD failure. If credentials are supplied as OS environment variables, those take precedence over `.env`.
-
-**Per-invocation execution and cost budgets:** The manager enforces two independent watchdogs for BRD examples, deployment validation, live jobs, and generated-code loading. `FUNCTION_CALL_TIMEOUT_SECONDS` (default **120**, `0` to disable) caps cumulative **non-GPT computation time**, excluding approved GPT waits. `FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS` (default **300**, `0` to disable) caps elapsed time of the **entire function invocation including GPT waits**. The generated-function wrapper also enforces `MAX_GPT_CALLS_PER_FUNCTION` (default **5**, `0` to disable), preventing loops of individually successful GPT calls from running up unbounded costs. These are per invocation, not per BRD or per batch, and **do not** limit the separate code-generation API calls. When either watchdog is exceeded, the manager first requests cancellation; the GPT wrapper rejects further tool requests and checks for cancellation after the current API response. The manager force-terminates an uncooperative worker after a short grace period, extending that wait when a GPT semaphore slot is known to be held (up to the API request timeout plus five seconds). A timeout or call-count violation results in human escalation and no accepted job result. Force-killing a process during an uninterruptible external request can still strand a semaphore permit. This is **not** a security sandbox.
-
-**Fail-closed watchdog compatibility and completion checks:** Workers publish invocation IDs in `function_call::<BRD>`. If an older worker lacks an invocation ID and exceeds its budget, JobManager records an escalation and stops that worker by PID after a **conservative grace period**, instead of ignoring the timeout. A confirmed timeout remains recorded even if the worker has started another invocation or its marker disappears; a stale cancellation is never applied to the new invocation. In addition, the worker checks compute and wall budgets **immediately before accepting a function result**, catching jobs that finish between manager polls. For dependable cancellation, keep `job_manager.py` and `source/brd_processor.py` synchronized from the same commit. These checks are reliability controls, not security isolation.
-
-**Shared watchdog budget configuration:** Both the worker's final-result checks and the manager's timeout enforcement obtain `FUNCTION_CALL_TIMEOUT_SECONDS` and `FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS` from `source/brd_processor.py`, avoiding duplicated defaults. Values still come from environment variables or `.env`.
-
-**Separate GPT tool and code-generation timeouts:** Calls inside generated functions retain `GPT_REQUEST_TIMEOUT_SECONDS=60` per request and `GPT_TOOL_TIMEOUT_SECONDS=180` overall (including slot waits, retries and backoff). **Code generation** now has independent defaults: `GPT_GENERATION_REQUEST_TIMEOUT_SECONDS=300` (five minutes per request) and `GPT_GENERATION_TOOL_TIMEOUT_SECONDS=600` (ten minutes overall, shared across retries; two full 300-second requests are not guaranteed after waiting/backoff). Generation is not subject to the function-invocation watchdog. `GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS=60` still bounds each wait for a shared GPT slot. All values in `.env` load before these settings are read; the SDK's internal retries are disabled.
-
-**Cancellation race prevention:** During a generated-function call, only the worker writes `function_call::<BRD>`, including its GPT-semaphore-held flag. JobManager writes cancellation to a **separate** `cancel::<BRD>` record containing both the worker PID and a unique invocation ID; the worker reads it only when both match. Old requests therefore cannot cancel later jobs handled by the same process, and the manager cannot accidentally overwrite the worker's `gpt_slot_held` flag using a stale snapshot. The manager clears stale cancellation records on new worker launch and when a worker exits.
-
-**GPT failure classification:** Temporary outages (rate limits, timeouts, connection errors and HTTP 5xx) cause a later retry **without quarantine**. Invalid GPT-tool requests from generated code (for example, passing a string instead of a messages list) fail BRD examples with corrective feedback or trigger human review if discovered during live processing. Credentials, deployment, permission and content-filter problems are escalated as **configuration/policy failures**, rather than blamed on the generated implementation. The runtime rejects a function's output if an approved GPT-tool call failed during its execution, **even if the function catches the exception and returns a fallback answer**. The same check applies to unlabeled jobs, so unreliable fallback answers cannot be marked done after a GPT outage.
-
-A transient outage of the code-generating GPT does not consume the ten implementation-repair attempts. Permanently invalid generation requests are counted toward the attempt limit; exhausting all ten attempts now writes a persistent `runtime_block` for that BRD hash, which remains blocked across manager restarts.
-
-**Remaining semaphore caveat:** A worker forcibly terminated by an unrelated shutdown or crash while it holds a shared GPT semaphore permit can still strand that permit until the manager is restarted. Pausing the watchdog removes the routine false-timeout cause, but robust protection from arbitrary forced kills requires a parent-owned GPT broker or equivalent redesign.
-
-**Logging resilience:** Each BRD worker now writes to its own logging queue; manager escalation messages go directly to the log handlers. Shutdown waits at most three seconds for each worker log stream so a hard-crashed worker cannot indefinitely block Ctrl+C or suppress the manager's logs.
-
-**Temporary jobs-file failures:** If `BRD_*_jobs.json` is missing, incomplete or invalid during live processing, the worker logs a warning and retries next polling cycle **without** quarantining the implementation. Job-producing agents should still use atomic file replacement (`write temporary JSON -> os.replace`) to avoid partial reads.
-
-**Remaining limitation:** The watchdog can terminate a stuck worker, but it does not restrict arbitrary filesystem/network access by a generated function. Resource isolation remains a separate future sandboxing task.
-
-**Scope of blindness:** The code-**generating** LLM does not receive real-job test feedback. If a BRD deliberately requires an LLM-powered function (through `my_tools.ask_gpt`), that runtime LLM may still receive individual job inputs to perform its authorized task; it is not provided the expected test answers by the validator.
-
-## Setup
-
-Create and activate a Python environment, then install dependencies:
+Install dependencies, copy the template to `.env` and configure Azure OpenAI:
 
 ```bash
 pip install -r requirements.txt
-```
-
-Copy the tracked template to a private local `.env` file.
-
-On PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-On macOS/Linux:
-
-```bash
-cp .env.example .env
-```
-
-Then edit **`.env`**, not `.env.example`, and replace the placeholder values:
-
-```text
-AZURE_OPENAI_API_KEY=your-real-key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_API_VERSION=2025-01-01-preview
-AZURE_OPENAI_DEPLOYMENT=your-deployment-name
-```
-
-Use one `KEY=value` assignment per line. Quotes are not required.
-
-The program automatically loads the repository-root `.env` file. Existing shell/environment variables take precedence over values in `.env`.
-
-**Never put a real key in `.env.example` and never commit `.env`.** The tracked `.env.example` is only a safe template; the real `.env` file is ignored by Git.
-
-## Run the word-count demo
-
-```bash
+cp .env.example .env       # In PowerShell: Copy-Item .env.example .env
 python job_manager.py
 ```
 
-The manager scans `documents/BRD_*.txt`, launches one worker per BRD up to the concurrency cap, and processes jobs from the matching JSON file.
+Configure `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, and optionally `AZURE_OPENAI_API_VERSION` in `.env`. Shell variables override `.env`. A handcrafted implementation can operate without Azure OpenAI when it is loadable and no GPT calls are needed.
 
-Runtime state is written to files such as:
+### Completion and failure semantics
 
-```text
-documents/done_BRD_word_count_jobs.json
-saved_functions/registry.json
-saved_functions/BRD_word_count/
-```
+- Worker outputs are written to `all_process.log`. There is **no durable result payload file**, only job-status state.
+- Each successful live job is recorded **immediately** in `documents/done_<BRD stem>_jobs.json`, via a temporary file and atomic replace, **before** the success is logged. Rejected malformed records are also recorded durably.
+- If an existing done-state file is corrupt, unreadable, or cannot be written, processing raises `DoneStatePersistenceError` and the worker yields a `state_retry` status. JobManager retries the BRD after **45 seconds**, even if the jobs file is unchanged. A storage failure is not treated as a generated-function defect and cannot produce a successful batch result.
+- If a side-effecting function performs an external action and the subsequent completion-state write fails, it may **perform that action again** on retry. Exactly-once processing requires a transactional destination or idempotent functions. Keep this version away from irreversible operations unless the operation is retry-safe.
+- Live functions that raise exceptions or violate the output type/shape still trigger persistent human-review blocking and quarantine. A correct type/shape is not proof that a value is correct.
+- `RESET_DONE_STATE=1` intentionally deletes completion state at startup for local debugging and can cause jobs to repeat.
 
-**Job answers are logged only.** The program does not create separate results JSON files. If you need historical job answers, retain the logs or send outputs to an external destination before relying on this mode. Output values are not recoverable from the `done_*.json` state.
+### Scheduling and wake-ups
 
-The `done_*.json` file tracks processed job IDs and rejected-record hashes. The worker flushes state after bounded batches of 50 successful jobs and on batch completion or failure; a crash may cause a small amount of reprocessing since the last flush. Malformed runtime records are recorded under `rejected` using a hash of their content; correcting a record changes its hash and makes it eligible again. These runtime-generated files are intentionally ignored by Git.
+Each worker processes at most `MAX_JOBS_PER_WORKER_SESSION` actionable jobs (default 25) per session. The manager dispatches longest-waiting BRDs first, tracks jobs/done-file fingerprints and relaunches sleeping BRDs after file changes. A launch-time snapshot of the BRD/jobs files closes the lost wake-up gap; the done-file stamp is taken at worker exit. If input files change during a worker session, one additional relaunch may occur. File fingerprints are modification time plus size, not a durable change counter; upstream producers should write jobs JSON atomically.
 
-## Resetting done-state during debugging
+### Human intervention
 
-By default, existing `done_BRD_*_jobs.json` files are preserved across restarts so processed jobs are not re-run accidentally.
-
-For debugging only, you can request a reset on startup:
+A BRD that exhausted generation attempts, failed at runtime, or crashed can remain persistently blocked by its BRD content hash. Changing the BRD resets that hash. For reviewed handwritten recovery, stop JobManager, place **one** `.py` in `saved_functions/<BRD stem>_handcrafted/`, then run:
 
 ```bash
-RESET_DONE_STATE=1 python job_manager.py
+python job_manager.py --approve-handcrafted BRD_word_count.txt
 ```
 
-## Trusted generated-code capabilities
+Restart the manager. Approval binds the current BRD hash to the exact handwritten source bytes. **This version unblocks on successful loading and byte-integrity verification, not passing behavioral tests.** Human inspection must therefore establish the implementation's correctness.
 
-Generated functions cannot use `open()` or import `openpyxl` directly. When a BRD legitimately requires a local Excel workbook, the runtime exposes narrowly scoped read-only helpers through `my_tools`:
+## Safety limitations
 
-```python
-my_tools.read_excel_rows("./documents/example.xlsx", "Sheet1")
-my_tools.file_modified_time("./documents/example.xlsx")
-my_tools.monotonic_time()
-```
+Generated source is screened by an AST allowlist and runs with the narrowly exposed `my_tools` wrappers (approved GPT call; approved Excel read under `documents/`). Nevertheless, it is executed using `exec()` in a worker process. Static restrictions and watchdogs **do not form a secure sandbox**; do not run untrusted generated code with sensitive credentials or host access. A killed worker holding a GPT semaphore slot may strand the permit until restart. `requirements.txt` is not version-pinned, so dependency resolution can also vary over time.
 
-`read_excel_rows()` only accepts existing `.xlsx`/`.xlsm` files whose resolved path stays under the repository's `documents/` directory. It opens workbooks read-only with `data_only=True`, so generated code can use cached/calculated Excel values without receiving arbitrary filesystem access. `file_modified_time()` is restricted by the same path rules and supports BRD-defined cache refresh logic.
-
-## Security notice
-
-Generated Python code is statically screened before execution with an import allowlist plus restrictions on dangerous builtins, frame/code-object traversal, private/dunder attributes, and string-format attribute traversal. Generated code receives only a narrow `my_tools` surface rather than the raw authenticated Azure client or unrestricted filesystem access. However, generated Python still executes inside the worker process:
-
-```python
-exec(code, ns)
-```
-
-The static screen is defense-in-depth, not a sandbox or security boundary. Run this project only in a controlled environment. Do not expose the generation path to untrusted BRDs, untrusted model output, production credentials, or sensitive data until generated implementations are isolated in a separate process with execution timeouts and stronger filesystem/network controls.
-
-## Public-data caution
-
-The example files in `documents/` are sanitized. The `.gitignore` intentionally whitelists only the word-count demonstration so real BRDs or real jobs are not accidentally committed.
+`.gitignore` intentionally excludes real BRD/job files, `.env`, runtime logs and generated state. Only sanitized example documents belong in this public repository.

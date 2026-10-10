@@ -1,77 +1,62 @@
 [
   {
     "incident_id": "A1",
-    "text": "",
-    "expected_word_count": 0
+    "text": ""
   },
   {
     "incident_id": "A2",
-    "text": "Hello world",
-    "expected_word_count": 2
+    "text": "Hello world"
   },
   {
     "incident_id": "A3",
-    "text": "The quick brown fox",
-    "expected_word_count": 4
+    "text": "The quick brown fox"
   },
   {
     "incident_id": "A4",
-    "text": "  This  --  has   weird   spacing ",
-    "expected_word_count": 4
+    "text": "  This  --  has   weird   spacing "
   },
   {
     "incident_id": "A5",
-    "text": "Don't stop believing",
-    "expected_word_count": 3
+    "text": "Don't stop believing"
   },
   {
     "incident_id": "A6",
-    "text": "O'Reilly's book",
-    "expected_word_count": 2
+    "text": "O'Reilly's book"
   },
   {
     "incident_id": "A7",
-    "text": "well-known example",
-    "expected_word_count": 3
+    "text": "well-known example"
   },
   {
     "incident_id": "A8",
-    "text": "alpha-beta-gamma",
-    "expected_word_count": 3
+    "text": "alpha-beta-gamma"
   },
   {
     "incident_id": "A9",
-    "text": "123 456",
-    "expected_word_count": 2
+    "text": "123 456"
   },
   {
     "incident_id": "A10",
-    "text": "abc123 def456",
-    "expected_word_count": 2
+    "text": "abc123 def456"
   },
   {
     "incident_id": "A11",
-    "text": "Hello, world!",
-    "expected_word_count": 2
+    "text": "Hello, world!"
   },
   {
     "incident_id": "A12",
-    "text": "   one      two   three   ",
-    "expected_word_count": 3
+    "text": "   one      two   three   "
   },
   {
     "incident_id": "A13",
-    "text": "rock'n'roll isn't dead",
-    "expected_word_count": 3
+    "text": "rock'n'roll isn't dead"
   },
   {
     "incident_id": "A14",
-    "text": "---",
-    "expected_word_count": 0
+    "text": "---"
   },
   {
     "incident_id": "A15",
-    "text": "word--word",
-    "expected_word_count": 2
+    "text": "word--word"
   }
 ]

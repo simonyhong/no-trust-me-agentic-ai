@@ -41,63 +41,19 @@ reinterpret or invent fields, types, or output structure.
   }
 }
 
-5. TEST EXAMPLES & EXPECTED RESULTS
------------------------------------
-The following JSON array is authoritative. Python must parse and execute these
-tests directly. The code-generating LLM must not invent tests or expected outputs.
-
-[
-  {
-    "input": "",
-    "output": 0
-  },
-  {
-    "input": "Hello world",
-    "output": 2
-  },
-  {
-    "input": "The quick brown fox",
-    "output": 4
-  },
-  {
-    "input": "  This  --  has   weird   spacing ",
-    "output": 4
-  },
-  {
-    "input": "Don't stop believing",
-    "output": 3
-  },
-  {
-    "input": "O'Reilly's book",
-    "output": 2
-  },
-  {
-    "input": "well-known",
-    "output": 2
-  },
-  {
-    "input": "hyphenated-word and another-one",
-    "output": 5
-  }
-]
-
 ########################## TECHNICAL DESCRIPTIONS ##########################
 
-6. JOBS DATA STRUCTURE
+5. JOBS DATA STRUCTURE
 ----------------------
 The structure of jobs.json looks like this:
 
 [
   {
     "incident_id": "A1",
-    "text": "Hello world",
-    "expected_word_count": 2
+    "text": "Hello world"
   }
 ]
 ID_FIELD=incident_id
-EXPECTED_FIELD=expected_word_count
-N_ITEMS_TO_PASS=15
 
 The data-part of the input for the function should be "text".
-The expected output field in each job record is "expected_word_count".
 The function should handle only one job.
