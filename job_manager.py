@@ -23,9 +23,9 @@ MAX_RECORD_BYTES = 64_000     # 64 KB cap per log record
 RESET_DONE_STATE = os.getenv("RESET_DONE_STATE", "0").strip().lower() in {"1", "true", "yes", "on"}
 # Cumulative non-GPT computation limit per function call. Set to 0 to disable.
 # This watchdog limits accidental hangs; it is not a security sandbox.
-FUNCTION_CALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_CALL_TIMEOUT_SECONDS", "120"))
+FUNCTION_CALL_TIMEOUT_SECONDS = brd_processor.FUNCTION_CALL_TIMEOUT_SECONDS
 # Total time per function invocation, INCLUDING GPT waits. Set to 0 to disable.
-FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS = float(os.getenv("FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS", "300"))
+FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS = brd_processor.FUNCTION_TOTAL_WALL_TIMEOUT_SECONDS
 # Give a cancelled invocation an opportunity to finish without leaking a GPT slot.
 FUNCTION_CANCELLATION_GRACE_SECONDS = max(0.0, float(os.getenv("FUNCTION_CANCELLATION_GRACE_SECONDS", "3")))
 
@@ -762,9 +762,9 @@ class JobManager:
             # Mark BRD available; clean exits may intentionally yield an idle slot.
             brd_done = self._pid_to_brd.pop(proc.pid, None)
             launched_hash = self._pid_to_brd_hash.pop(proc.pid, None)
-            if brd_done is not None and exit_code == 0:
-                self._consider_worker_yield(brd_done, proc.pid)
             watchdog_failure = self._timed_out_pids.pop(proc.pid, None)
+            if brd_done is not None and exit_code == 0 and watchdog_failure is None:
+                self._consider_worker_yield(brd_done, proc.pid)
             worker_log = self._pid_to_log.pop(proc.pid, None)
             if brd_done is not None:
                 self._inflight_brds.discard(brd_done)
@@ -826,11 +826,19 @@ class JobManager:
                                 registry_lock=self.shared_data.get("lock"),
                                 origin="unexpected_worker_exit",
                             )
-                            self.logger.error(
-                                "ESCALATE TO HUMAN: worker for %s exited unexpectedly (%s). "
-                                "BRD hash %s blocked; no automatic restart.",
-                                brd_done.name, exit_code, launched_hash,
-                            )
+                            if watchdog_failure is not None:
+                                self.logger.error(
+                                    "ESCALATE TO HUMAN: worker for %s stopped after a "
+                                    "watchdog budget violation (exit code=%s): %s. "
+                                    "BRD hash %s blocked; no automatic restart.",
+                                    brd_done.name, exit_code, reason, launched_hash,
+                                )
+                            else:
+                                self.logger.error(
+                                    "ESCALATE TO HUMAN: worker for %s exited unexpectedly "
+                                    "(exit code=%s). BRD hash %s blocked; no automatic restart.",
+                                    brd_done.name, exit_code, launched_hash,
+                                )
                         else:
                             self.logger.warning(
                                 "Worker %s exited after its BRD changed (%s -> %s); "
