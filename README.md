@@ -12,9 +12,11 @@ Implementation selection (for the current BRD content hash):
 2. Previously saved generated implementation indexed by `saved_functions/registry.json`.
 3. A new GPT-generated function when no acceptable existing implementation is available.
 
-**Each candidate must pass Python-owned validation before deployment:** all BRD-authored example tests, output contract checks, and the **first `N_ITEMS_TO_PASS` labeled real jobs** from the jobs file. A generated candidate that fails BRD examples can receive example-derived feedback and be regenerated up to ten times. If it passes examples but fails the blind N-job gate, the BRD is blocked for human review; the failing real-job inputs, labels and outputs are **not** sent back to the code-generating LLM. Passing these finite checks does not prove correctness for every possible input.
+**New or modified implementations must pass Python-owned validation before first use:** all BRD-authored example tests, output contract checks, and the **first `N_ITEMS_TO_PASS` labeled real jobs** from the jobs file. A generated candidate that fails BRD examples can receive example-derived feedback and be regenerated up to ten times. If it passes examples but fails the blind N-job gate, the BRD is blocked for human review; the failing real-job inputs, labels and outputs are **not** sent back to the code-generating LLM. Passing these finite checks does not prove correctness for every possible input.
 
-Every new worker process repeats the checks, including on relaunch after an idle yield. Live labeled jobs are also checked against their expected answers; invalid output shapes or incorrect labeled answers trigger quarantine and persistent human-review blocking. An unlabeled live job can still execute, provided its inputs and outputs satisfy the declared contract.
+**A worker relaunch does not repeat deployment validation for unchanged, registered code.** The existing registry entry is keyed by BRD content hash. For generated code, registration stores its source hash; for handcrafted code, registration stores the filename and source hash. If those bytes and the BRD remain unchanged, the worker loads the function without BRD-example or N-job tests, even if the historical labeled jobs are no longer in the jobs file. An edited implementation must pass both gates again. Legacy generated registrations without a source hash are adopted once from the existing registered script (which was originally saved after successful validation), without demanding historical test jobs. No extra validation-status field or protocol version is added.
+
+**Human-approved recovery of a blocked BRD always runs both gates again**, even if that handcrafted file was previously registered. Live labeled jobs are also checked against their expected answers; invalid output shapes or incorrect labeled answers trigger quarantine and persistent human-review blocking. An unlabeled live job can still execute, provided its inputs and outputs satisfy the declared contract.
 
 ## Repository layout
 
@@ -62,7 +64,7 @@ For this example the jobs JSON contains records such as:
 [{"incident_id": "A1", "text": "Hello world", "expected_word_count": 2}]
 ```
 
-At least `N_ITEMS_TO_PASS` labeled jobs must be available before a function is deployed. The demo BRD includes eight example tests; its jobs file includes fifteen labeled deployment jobs. The function name is derived from the filename: `BRD_word_count.txt` maps to `word_count()`.
+At least `N_ITEMS_TO_PASS` labeled jobs must be available for first-time qualification or requalification of modified code; they are **not** required for subsequent launches of an unchanged registered function. The demo BRD includes eight example tests; its jobs file includes fifteen labeled deployment jobs. The function name is derived from the filename: `BRD_word_count.txt` maps to `word_count()`.
 
 ## Run
 
@@ -86,7 +88,7 @@ Set `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, 
 
 ## Scheduling and oversight
 
-Each worker processes at most `MAX_JOBS_PER_WORKER_SESSION` actionable jobs (25 by default) before yielding. The manager dispatches longest-waiting BRDs first and relaunches idle BRDs when BRD/jobs/done-file fingerprints change. BRD and jobs fingerprints are captured at launch to prevent missed wake-ups between the worker's final read and exit; done-file stamps are recorded after exit. An extra validation/relaunch can occur after changes during a worker's session. File metadata is an imperfect change detector; producers should update jobs JSON atomically.
+Each worker processes at most `MAX_JOBS_PER_WORKER_SESSION` actionable jobs (25 by default) before yielding. The manager dispatches longest-waiting BRDs first and relaunches idle BRDs when BRD/jobs/done-file fingerprints change. BRD and jobs fingerprints are captured at launch to prevent missed wake-ups between the worker's final read and exit; done-file stamps are recorded after exit. An extra short relaunch can occur after changes during a worker's session, but an unchanged registered implementation does not repeat deployment validation. File metadata is an imperfect change detector; producers should update jobs JSON atomically.
 
 Function execution and GPT tools have time/call budgets configured in `.env.example`. Failed deployed functions, exhausted generation attempts and unsuccessful blind N-job validation create persistent human-review blocks. The manager distinguishes ordinary worker yields from crashes and confirmed watchdog violations. An approved handwritten recovery requires a stopped manager, exactly one reviewed `.py` in the corresponding handcrafted directory, and:
 

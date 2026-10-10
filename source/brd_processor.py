@@ -960,6 +960,8 @@ def finish_handcrafted_recovery(
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
         if successful:
+            # Approved recovery passed both gates and its source still matches approval.
+            meta["handcrafted_source"] = {"script": approval["script"], "content_hash": approval["content_hash"]}
             meta.pop("runtime_block", None)
             meta["quarantine"] = [
                 item for item in meta.get("quarantine", [])
@@ -1025,6 +1027,7 @@ def save_source(hash_signature: str, code: str, func_name: str, brd_path: pathli
         existing.update({
             "title": brd_path.name,
             "latest_script": filename,
+            "source_hash": hashlib.blake2s(code.encode("utf-8"), digest_size=16).hexdigest(),
             "function_name": func_name,
             "folder_name": brd_stem,
         })
@@ -1615,6 +1618,10 @@ class BlindDeploymentValidationFailure(RuntimeError):
     """
 
 
+class DeploymentValidationDataUnavailable(RuntimeError):
+    """A new or modified implementation needs labeled jobs before first use."""
+
+
 def _get_or_create_function(
     brd_path: pathlib.Path,
     brd_text: str,
@@ -1623,7 +1630,7 @@ def _get_or_create_function(
     contract: dict[str, Any],
     brd_tests: list[tuple[tuple[Any, ...], Any, int]],
     n_items_to_pass: int,
-    deployment_jobs: list[dict[str, Any]],
+    jobs_path: pathlib.Path,
     saved_func_dir: pathlib.Path,
     registry_path: pathlib.Path,
     gpt_semaphore: multiprocessing.Semaphore,
@@ -1643,6 +1650,35 @@ def _get_or_create_function(
         "incident_id": schema["incident_id"],
         "expected": schema["expected"],
     }
+    deployment_jobs = None
+
+    def need_deployment_jobs():
+        nonlocal deployment_jobs
+        if deployment_jobs is None:
+            try:
+                deployment_jobs, labeled_count = prepare_deployment_validation_jobs(
+                    jobs_path, jobs_schema, contract, n_items_to_pass
+                )
+            except Exception as exc:
+                raise DeploymentValidationDataUnavailable(str(exc)) from exc
+            logger.info("Deployment preflight for %s: using first %d labeled job(s) out of %d labeled",
+                        brd_path.name, n_items_to_pass, labeled_count)
+        return deployment_jobs
+
+    def remember_source(key: str, metadata: dict) -> None:
+        # Registry metadata is keyed by the BRD hash; no separate validation flag.
+        def update():
+            registry = load_registry(registry_path)
+            entry = registry.setdefault(hash_signature, {})
+            entry.setdefault("title", brd_path.name)
+            entry.setdefault("folder_name", brd_path.stem)
+            entry[key] = metadata
+            save_registry(registry_path, registry)
+        if registry_lock is None:
+            update()
+        else:
+            with registry_lock:
+                update()
 
     # [1] Handcrafted implementation.
     handcrafted = saved_func_dir / f"{brd_path.stem}_handcrafted"
@@ -1659,7 +1695,12 @@ def _get_or_create_function(
             if not handcrafted_only and is_quarantined(registry_path, hash_signature, script_name, script_path=py_path):
                 logger.info("Handcrafted impl %s is quarantined; skipping.", script_name)
             else:
+                source_hash = _source_content_hash(py_path)
+                if source_hash is None:
+                    raise OSError(f"Cannot read handcrafted source: {py_path}")
                 hc_mod = load_script(namespace=f"hc_{hash_signature}", py_path=py_path)
+                if _source_content_hash(py_path) != source_hash:
+                    raise RuntimeError("Handcrafted source changed while loading; retry required")
                 if hasattr(hc_mod, expected_function_name):
                     hc_func_name = expected_function_name
                     hc_func = getattr(hc_mod, hc_func_name)
@@ -1682,23 +1723,36 @@ def _get_or_create_function(
                         "deterministic BRD-derived name is %s().",
                         hc_func_name, expected_function_name,
                     )
+                existing = load_registry(registry_path).get(hash_signature, {})
+                registered = existing.get("handcrafted_source", {}) if isinstance(existing, dict) else {}
+                unchanged = (not handcrafted_only and isinstance(registered, dict)
+                             and registered.get("script") == script_name
+                             and registered.get("content_hash") == source_hash)
+                if unchanged:
+                    logger.info("✨ Reusing unchanged registered handcrafted %s() without deployment tests", hc_func_name)
+                    return hc_func, hc_func_name, {
+                        "origin": "handcrafted", "script_name": script_name, "script_path": str(py_path)
+                    }
+                validated_jobs = need_deployment_jobs()
                 ok_brd, _ = run_brd_tests(hc_func, brd_tests, contract)
                 if ok_brd:
                     ok_deploy, deploy_reflection = run_deployment_validation_jobs(
-                        hc_func, jobs_schema, deployment_jobs, contract["output"]
+                        hc_func, jobs_schema, validated_jobs, contract["output"]
                     )
                     if ok_deploy:
-                        logger.info(
-                            "✅ Using handcrafted %s() after passing %d labeled deployment job(s)",
-                            expected_function_name, n_items_to_pass,
-                        )
+                        if _source_content_hash(py_path) != source_hash:
+                            raise RuntimeError("Handcrafted source changed during validation; retry required")
+                        if not handcrafted_only:
+                            remember_source("handcrafted_source", {"script": script_name, "content_hash": source_hash})
+                        logger.info("✅ Using handcrafted %s() after passing %d labeled deployment job(s)",
+                                    expected_function_name, n_items_to_pass)
                         return hc_func, hc_func_name, {
                             "origin": "handcrafted", "script_name": script_name, "script_path": str(py_path)
                         }
                     logger.warning("Handcrafted impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.warning("Handcrafted impl failed BRD-authored tests/contract")
-        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError, DeploymentValidationDataUnavailable):
             raise
         except Exception as exc:
             logger.warning("Handcrafted load/test failed: %s", exc)
@@ -1723,6 +1777,9 @@ def _get_or_create_function(
             if is_quarantined(registry_path, hash_signature, script_name, script_path=cached_path):
                 logger.info("Cached impl %s is quarantined; skipping.", script_name)
             else:
+                source_hash = _source_content_hash(cached_path)
+                if source_hash is None:
+                    raise OSError(f"Cannot read cached source: {cached_path}")
                 _static_safety_check(cached_path.read_text(encoding="utf-8"))
                 cached_mod = _invoke_monitored(
                     load_script, phase="cached_code_load",
@@ -1735,30 +1792,46 @@ def _get_or_create_function(
                 if not hasattr(cached_mod, func_name):
                     raise RuntimeError(f"Cached module missing {func_name}()")
                 cached_func = getattr(cached_mod, func_name)
+                if _source_content_hash(cached_path) != source_hash:
+                    raise RuntimeError("Cached source changed while loading; retry required")
+                registered_hash = meta.get("source_hash")
+                if registered_hash is None:
+                    # Older registry entries were written only after successful tests.
+                    # Adopt their existing script without needing historic labeled jobs.
+                    remember_source("source_hash", source_hash)
+                    registered_hash = source_hash
+                if source_hash == registered_hash:
+                    logger.info("✨ Reusing unchanged registered %s() without deployment tests", func_name)
+                    return cached_func, func_name, {
+                        "origin": "cached", "script_name": script_name, "script_path": str(cached_path)
+                    }
+                validated_jobs = need_deployment_jobs()
                 ok_brd, _ = run_brd_tests(cached_func, brd_tests, contract)
                 if ok_brd:
                     ok_deploy, deploy_reflection = run_deployment_validation_jobs(
-                        cached_func, jobs_schema, deployment_jobs, contract["output"]
+                        cached_func, jobs_schema, validated_jobs, contract["output"]
                     )
                     if ok_deploy:
-                        logger.info(
-                            "✨ Reusing cached implementation after %d labeled deployment job(s): %s()",
-                            n_items_to_pass, func_name,
-                        )
+                        if _source_content_hash(cached_path) != source_hash:
+                            raise RuntimeError("Cached source changed during validation; retry required")
+                        remember_source("source_hash", source_hash)
+                        logger.info("✅ Requalified modified cached %s() after BRD + %d labeled jobs",
+                                    func_name, n_items_to_pass)
                         return cached_func, func_name, {
                             "origin": "cached", "script_name": script_name, "script_path": str(cached_path)
                         }
                     logger.info("Cached impl failed labeled deployment validation: %s", deploy_reflection)
                 else:
                     logger.info("Cache invalid – BRD-authored tests/contract failed")
-        except (ExternalGPTUnavailable, GPTServiceConfigurationError):
+        except (ExternalGPTUnavailable, GPTServiceConfigurationError, DeploymentValidationDataUnavailable):
             raise
         except Exception as exc:
             logger.warning("Cache load/test failed: %s", exc)
     elif latest_script and skip_reuse_once:
         logger.info("Previous batch failure -> skipping cached reuse this loop.")
 
-    # [3] GPT generation. GPT writes code only; Python owns inspection.
+    # [3] GPT generation. Never call the generator without the first N labeled jobs.
+    validated_jobs = need_deployment_jobs()
     logger.info("🤖 Proceeding to GPT generation...")
     generation_contract = {
         "function_name": expected_function_name,
@@ -1848,7 +1921,7 @@ def _get_or_create_function(
 
         # Deployment gate: exactly the first N labeled jobs selected by Python.
         ok_deploy, reflection2 = run_deployment_validation_jobs(
-            func, jobs_schema, deployment_jobs, contract["output"]
+            func, jobs_schema, validated_jobs, contract["output"]
         )
         if not ok_deploy:
             # BLIND HOLDOUT: the Python validator may log the failure for a human,
@@ -2374,37 +2447,11 @@ def process_single_brd_standalone(
                         brd_path.name, schema["function_name"], id_field, expected_field,
                     )
 
-                # ----------------- Deployment-data preflight + ensure function -----------------
+                # ----------------- Ensure function -----------------
+                # An unchanged registered implementation needs no labeled deployment jobs.
+                # Only new/modified candidates require the N-job preflight and both gates.
                 if cached_func is None:
-                    jobs_schema_for_deploy = {
-                        "inputs": [item["name"] for item in contract["input"]],
-                        "expected": schema["expected"],
-                        "incident_id": schema["incident_id"],
-                    }
                     jobs_path_for_deploy = brd_path.with_name(f"{brd_path.stem}_jobs.json")
-
-                    try:
-                        deployment_jobs, labeled_count = prepare_deployment_validation_jobs(
-                            jobs_path_for_deploy, jobs_schema_for_deploy, contract, n_items_to_pass
-                        )
-                        next_deployment_preflight_warn_ts = 0.0
-                        module_logger.info(
-                            "Deployment preflight for %s: using first %d labeled job(s) out of %d labeled",
-                            brd_path.name, n_items_to_pass, labeled_count,
-                        )
-                    except Exception as exc:
-                        # Do not call the implementation-generating LLM while deployment is impossible.
-                        # Yield while waiting for valid input; JobManager relaunches on file changes.
-                        if now >= next_deployment_preflight_warn_ts:
-                            module_logger.warning(
-                                "Deployment preflight blocked for %s: %s. No function will be generated/deployed "
-                                "until the jobs data satisfies N_ITEMS_TO_PASS=%d.",
-                                brd_path.name, exc, n_items_to_pass,
-                            )
-                            next_deployment_preflight_warn_ts = now + warn_bad_BRD_every_x_seconds
-                        _yield_slot("waiting_input")
-                        break
-
                     try:
                         func, func_name, impl_meta = _get_or_create_function(
                             brd_path=brd_path,
@@ -2414,7 +2461,7 @@ def process_single_brd_standalone(
                             contract=contract,
                             brd_tests=brd_tests,
                             n_items_to_pass=n_items_to_pass,
-                            deployment_jobs=deployment_jobs,
+                            jobs_path=jobs_path_for_deploy,
                             saved_func_dir=saved_func_dir,
                             registry_path=registry_path,
                             gpt_semaphore=gpt_semaphore,
@@ -2424,6 +2471,16 @@ def process_single_brd_standalone(
                             reflection=last_reflection,
                             handcrafted_only=bool(approved_recovery),
                         )
+                    except DeploymentValidationDataUnavailable as exc:
+                        if now >= next_deployment_preflight_warn_ts:
+                            module_logger.warning(
+                                "Deployment preflight blocked for %s: %s. New/modified functions need "
+                                "N_ITEMS_TO_PASS=%d labeled jobs; registered unchanged functions do not.",
+                                brd_path.name, exc, n_items_to_pass,
+                            )
+                            next_deployment_preflight_warn_ts = now + warn_bad_BRD_every_x_seconds
+                        _yield_slot("waiting_input")
+                        break
                     except BlindDeploymentValidationFailure as exc:
                         # Do not retry, regenerate, or send any blind-test data to GPT.
                         blocked_hash = current_hash
