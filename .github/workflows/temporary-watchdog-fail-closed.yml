@@ -1,0 +1,33 @@
+name: Temporary watchdog fail-closed tests
+on:
+  push:
+    branches: [watchdog-fail-closed-protocol]
+jobs:
+  watchdog:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m py_compile job_manager.py source/brd_processor.py tests/test_watchdog_fail_closed.py
+      - name: Legacy protocol, advanced invocation, and result-boundary regression
+        run: python tests/test_watchdog_fail_closed.py
+      - name: Existing fair scheduling regression
+        run: python tests/test_scheduler_fairness.py
+      - name: Export updated source files
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntm_watchdog_fail_closed_files
+          path: |
+            job_manager.py
+            source/brd_processor.py
+            tests/test_watchdog_fail_closed.py
+          retention-days: 2
