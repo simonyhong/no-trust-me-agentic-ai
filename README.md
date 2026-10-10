@@ -12,8 +12,6 @@ The key principle is simple: **The LLM writes the code, but Python—not the LLM
 
 Once validated, the function is saved and reused to process future jobs without repeatedly calling the code-generating LLM. Passing the prescribed tests reduces the risk of coding errors but does not guarantee correctness for every possible input.
 
-The project has **two runtime Python modules**: `job_manager.py` and `source/brd_processor.py`. BRD/example validation and the blind real-job deployment gate live inside `brd_processor.py`, **not** in a separate developer `tests/` folder. That folder was intentionally removed.
-
 ## How it works
 
 `job_manager.py` discovers `documents/BRD_*.txt`, starts bounded-concurrency workers, and manages scheduling, logging, cancellation and watchdogs. `source/brd_processor.py` parses each BRD, selects an implementation, independently validates it, then processes its jobs from the matching `BRD_*_jobs.json` file.
