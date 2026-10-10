@@ -1,5 +1,17 @@
 # No-Trust-Me Agentic AI — BRD Worker Prototype
 
+## Motivation
+
+This project was created to address a fundamental problem with LLM-generated code: **How can we trust code written by an LLM when the LLM itself can make mistakes?**
+
+**No-Trust-Me Agentic AI** is a no-code agentic AI framework designed to reduce reliance on blindly trusting LLM-generated code.
+
+Users describe their business requirements in a Business Requirement Document (BRD), and an LLM generates the necessary Python functions. However, instead of trusting the generated code—or asking the LLM to evaluate its own work—the system uses **independent Python-based validation** to check the function against user-defined test examples and real-job cases before deployment.
+
+The key principle is simple: **The LLM writes the code, but Python—not the LLM—determines whether the code passes the required tests.**
+
+Once validated, the function is saved and reused to process future jobs without repeatedly calling the code-generating LLM. Passing the prescribed tests reduces the risk of coding errors but does not guarantee correctness for every possible input.
+
 The project has **two runtime Python modules**: `job_manager.py` and `source/brd_processor.py`. BRD/example validation and the blind real-job deployment gate live inside `brd_processor.py`, **not** in a separate developer `tests/` folder. That folder was intentionally removed.
 
 ## How it works
