@@ -31,9 +31,9 @@ _RETRY_STEPS = 6
 GPT_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_TOOL_TIMEOUT_SECONDS", "180")))
 GPT_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_REQUEST_TIMEOUT_SECONDS", "60")))
 # Generation may require longer than the GPT tool used by active functions.
-# The generation request gets 5 minutes, with a 6-minute overall retry budget.
+# The generation request gets 5 minutes, with a 10-minute overall retry budget.
 GPT_GENERATION_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_GENERATION_REQUEST_TIMEOUT_SECONDS", "300")))
-GPT_GENERATION_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_GENERATION_TOOL_TIMEOUT_SECONDS", "360")))
+GPT_GENERATION_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_GENERATION_TOOL_TIMEOUT_SECONDS", "600")))
 GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS", "60")))
 MAX_ATTEMPTS = 10
 # Maximum actionable records a BRD worker processes before yielding for fairness.
