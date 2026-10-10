@@ -47,6 +47,10 @@ class JobManager:
         self._snoozed_fingerprints: dict[str, tuple] = {}
         self._retry_after: dict[str, float] = {}
         self._session_blocks: set[str] = set()  # GPT configuration issues until manager restart
+        # Oldest-served-first dispatch. Newly discovered BRDs have no sequence
+        # and are considered before BRDs that have already occupied a slot.
+        self._dispatch_sequence = 0
+        self._last_dispatched_sequence: dict[str, int] = {}
         self.active_processes = []
         self.gpt_semaphore = multiprocessing.BoundedSemaphore(SEMAPHORE_LIMIT)
 
@@ -301,6 +305,17 @@ class JobManager:
                 return None
         return (stamp(brd), stamp(jobs), stamp(done))
 
+    def _ordered_brds_for_dispatch(self, brds: list[pathlib.Path]) -> list[pathlib.Path]:
+        """Choose longest-waiting BRDs first, not alphabetical BRDs first.
+
+        A successful process start records a monotonically increasing sequence.
+        BRDs never dispatched get priority (-1), then older dispatches. Name
+        breaks ties deterministically, but cannot repeatedly outrank a BRD
+        that has waited longer since its last dispatch.
+        """
+        served = self._last_dispatched_sequence
+        return sorted(brds, key=lambda brd: (served.get(brd.name, -1), brd.name))
+
     def _consider_worker_yield(self, brd: pathlib.Path, proc_pid: int) -> None:
         """Capture clean worker yield before freeing its concurrency slot."""
         reason = None
@@ -355,13 +370,15 @@ class JobManager:
                         self.logger.warning("Documents directory not found: %s", docs_dir)
                         docs_dir.mkdir(parents=True, exist_ok=True)
 
-                    brd_files = sorted(docs_dir.glob("BRD_*.txt"))
+                    brd_files = list(docs_dir.glob("BRD_*.txt"))
                     if exclude_list:
                         brd_files = [b for b in brd_files if b.name not in exclude_list]
                     if only_list:
                         brd_files = [b for b in brd_files if b.name in only_list]
 
-                    for brd in brd_files:
+                    # Reorder every scan based on actual successful dispatches.
+                    # The oldest-served eligible BRD always gets first choice.
+                    for brd in self._ordered_brds_for_dispatch(brd_files):
                         if brd in self._inflight_brds:
                             continue
                         if brd.name in self._session_blocks:
@@ -397,8 +414,10 @@ class JobManager:
                                 continue
                             if unchanged and retry_time is None:
                                 continue
-                            if retry_time is not None:
-                                self._retry_after.pop(brd.name, None)
+                            # Crucial: do NOT consume an expired retry marker until
+                            # this BRD actually starts a worker. If all slots are
+                            # occupied, dropping it makes unchanged pending work
+                            # look idle forever (including unfinished batches).
                         if not self._can_start_new_job():
                             break
 
@@ -441,6 +460,10 @@ class JobManager:
                             self._pid_to_brd[proc.pid] = brd
                             self._pid_to_brd_hash[proc.pid] = launch_hash
                             self._pid_to_log[proc.pid] = worker_log
+                            # Mark service only after process startup succeeds.
+                            self._dispatch_sequence += 1
+                            self._last_dispatched_sequence[brd.name] = self._dispatch_sequence
+                            self._retry_after.pop(brd.name, None)
                             self.logger.info("Started process %d for %s", proc.pid, brd.name)
                         except Exception as exc:
                             self.logger.error("Failed to start process for %s: %s", brd.name, exc)
