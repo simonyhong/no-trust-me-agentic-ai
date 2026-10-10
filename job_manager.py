@@ -411,6 +411,8 @@ class JobManager:
                             if shared is not None:
                                 shared[f"stop::{abs_brd.name}"] = False
                                 shared.pop(f"worker_yield::{abs_brd.name}", None)
+                                # Clear a cancellation left by a previous worker.
+                                shared.pop(f"cancel::{abs_brd.name}", None)
                         except Exception:
                             pass
 
@@ -591,27 +593,46 @@ class JobManager:
                         f"Function exceeded {kind} budget: {elapsed:.1f}s elapsed "
                         f"(limit {limit:.1f}s, phase={state.get('phase', 'function_call')})"
                     )
+                    # The worker alone writes function_call::<BRD>. The manager
+                    # writes cancel::<BRD> with a per-invocation token instead;
+                    # no read-modify-write race can reset gpt_slot_held.
+                    invocation_id = state.get("invocation_id")
+                    if not invocation_id:
+                        self.logger.warning("Missing invocation ID for BRD %s; cannot cancel safely", brd.name)
+                        continue
+                    # A finished or replaced invocation should not be cancelled.
+                    latest = shared.get(key)
+                    if not isinstance(latest, dict) or latest.get("pid") != proc.pid or latest.get("invocation_id") != invocation_id:
+                        continue
                     failure = {
                         "phase": str(state.get("phase", "function_call")),
                         "elapsed": elapsed, "limit": limit,
                         "kind": kind, "reason": reason, "requested_at": now,
+                        "invocation_id": invocation_id,
                     }
                     self._timed_out_pids[proc.pid] = failure
-                    state["cancel_requested"] = True
-                    state["cancel_reason"] = reason
-                    shared[key] = state
+                    shared[f"cancel::{brd.name}"] = {
+                        "pid": proc.pid, "invocation_id": invocation_id, "reason": reason,
+                    }
                     self.logger.error(
                         "ESCALATE TO HUMAN: BRD %s worker %s %s. "
                         "Requesting cooperative cancellation.", brd.name, proc.pid, reason,
                     )
                     continue
 
-                # A worker pause/resume marker update could race with our first
-                # cancellation write. Reassert the request on subsequent ticks.
-                if not state.get("cancel_requested", False):
-                    state["cancel_requested"] = True
-                    state["cancel_reason"] = failure.get("reason", "Function execution budget exceeded")
-                    shared[key] = state
+                # Both keys have a single owner. Never write back the worker's
+                # timing/slot marker from the manager's stale read.
+                if failure.get("invocation_id") != state.get("invocation_id"):
+                    self.logger.warning(
+                        "BRD %s advanced invocation after cancellation request; "
+                        "discarding stale cancellation for %s", brd.name, failure.get("invocation_id"),
+                    )
+                    cancel_key = f"cancel::{brd.name}"
+                    current_cancel = shared.get(cancel_key)
+                    if isinstance(current_cancel, dict) and current_cancel.get("pid") == proc.pid and current_cancel.get("invocation_id") == failure.get("invocation_id"):
+                        shared.pop(cancel_key, None)
+                    self._timed_out_pids.pop(proc.pid, None)
+                    continue
 
                 # The worker has been told to stop. Once it returns from a GPT
                 # call it can release the semaphore before honoring cancellation.
@@ -786,6 +807,18 @@ class JobManager:
                     if shared is not None:
                         shared[f"stop::{brd_done.name}"] = False
                 except Exception:
+                    pass
+
+            # Clear this exited worker's cancellation without affecting a new PID.
+            if brd_done is not None:
+                try:
+                    shared = self.shared_data.get("shared_dict")
+                    if shared is not None:
+                        key = f"cancel::{brd_done.name}"
+                        cancel = shared.get(key)
+                        if isinstance(cancel, dict) and cancel.get("pid") == proc.pid:
+                            shared.pop(key, None)
+                except (OSError, EOFError, BrokenPipeError):
                     pass
 
             # Abandon only this worker's potentially corrupted logging pipe.
