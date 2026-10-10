@@ -10,7 +10,7 @@ Users describe their business requirements in a Business Requirement Document (B
 
 The key principle is simple: **The LLM writes the code, but Python—not the LLM—determines whether the code passes the required tests.**
 
-Once validated, the function is saved and reused to process future jobs without repeatedly calling the code-generating LLM. Passing the prescribed tests reduces the risk of coding errors but does not guarantee correctness for every possible input.
+Once validated, the function is saved and reused to process future jobs without repeatedly calling the code-generating LLM. 
 
 ## How it works
 
