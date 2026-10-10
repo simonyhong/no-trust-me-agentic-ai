@@ -19,6 +19,7 @@ import traceback
 import tempfile
 import ast
 import logging, sys
+import uuid
 
 # Load a developer-local .env before reading any configured timeout.
 # Existing shell/environment variables take precedence.
@@ -29,6 +30,10 @@ _RETRY_STEPS = 6
 # Limits for GPT as an external service; independent of function-compute watchdog.
 GPT_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_TOOL_TIMEOUT_SECONDS", "180")))
 GPT_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_REQUEST_TIMEOUT_SECONDS", "60")))
+# Generation may require longer than the GPT tool used by active functions.
+# The generation request gets 5 minutes, with a 6-minute overall retry budget.
+GPT_GENERATION_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_GENERATION_REQUEST_TIMEOUT_SECONDS", "300")))
+GPT_GENERATION_TOOL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_GENERATION_TOOL_TIMEOUT_SECONDS", "360")))
 GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS = max(1.0, float(os.getenv("GPT_SEMAPHORE_WAIT_TIMEOUT_SECONDS", "60")))
 MAX_ATTEMPTS = 10
 # Maximum actionable records a BRD worker processes before yielding for fairness.
@@ -273,6 +278,8 @@ Never access a raw authenticated model client, shared_data, or a semaphore direc
 
     resp = gpt_call_with_retry(
         gpt_semaphore,
+        request_timeout_seconds=GPT_GENERATION_REQUEST_TIMEOUT_SECONDS,
+        tool_timeout_seconds=GPT_GENERATION_TOOL_TIMEOUT_SECONDS,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -1084,7 +1091,10 @@ def _classify_gpt_error(exc: BaseException) -> str:
 _temperature_unsupported = False
 
 
-def gpt_call_with_retry(semaphore, *, on_slot_change=None, check_cancel=None, **kwargs):
+def gpt_call_with_retry(
+    semaphore, *, on_slot_change=None, check_cancel=None,
+    request_timeout_seconds=None, tool_timeout_seconds=None, **kwargs,
+):
     """Bound a GPT interaction separately from the generated-function watchdog.
 
     The API call has a per-attempt timeout, the semaphore wait is bounded,
@@ -1101,7 +1111,10 @@ def gpt_call_with_retry(semaphore, *, on_slot_change=None, check_cancel=None, **
     call_kwargs = dict(kwargs)
     if _temperature_unsupported:
         call_kwargs.pop("temperature", None)
-    deadline = time.monotonic() + GPT_TOOL_TIMEOUT_SECONDS
+    # Explicit generation-specific budgets do not affect GPT calls inside functions.
+    request_budget = GPT_REQUEST_TIMEOUT_SECONDS if request_timeout_seconds is None else max(1.0, float(request_timeout_seconds))
+    tool_budget = GPT_TOOL_TIMEOUT_SECONDS if tool_timeout_seconds is None else max(1.0, float(tool_timeout_seconds))
+    deadline = time.monotonic() + tool_budget
     backoff = 1.0
     last_error = None
     for _ in range(_RETRY_STEPS):
@@ -1124,7 +1137,7 @@ def gpt_call_with_retry(semaphore, *, on_slot_change=None, check_cancel=None, **
             if remaining <= 0:
                 last_error = TimeoutError("GPT tool timeout exceeded before API request")
                 break
-            per_request = min(GPT_REQUEST_TIMEOUT_SECONDS, remaining)
+            per_request = min(request_budget, remaining)
             return gpt_client.chat.completions.create(
                 model=my_tools.gpt_model,
                 timeout=per_request,
@@ -1166,7 +1179,7 @@ def gpt_call_with_retry(semaphore, *, on_slot_change=None, check_cancel=None, **
         time.sleep(sleep)
         backoff = min(backoff * 2, 60)
     raise TimeoutError(
-        f"GPT service unavailable within {GPT_TOOL_TIMEOUT_SECONDS:g}s or {_RETRY_STEPS} retries"
+        f"GPT service unavailable within {tool_budget:g}s or {_RETRY_STEPS} retries"
     ) from last_error
 
 
@@ -2081,6 +2094,7 @@ def process_single_brd_standalone(
             if event == "start":
                 shared[key] = {
                     "pid": os.getpid(),
+                    "invocation_id": uuid.uuid4().hex,
                     "started_monotonic": now,
                     "wall_started_monotonic": now,  # Does not pause for GPT calls.
                     "phase": phase,
@@ -2092,7 +2106,14 @@ def process_single_brd_standalone(
             if not isinstance(state, dict) or state.get("pid") != os.getpid():
                 return
             if event == "check_cancel":
-                return state.get("cancel_reason") if state.get("cancel_requested") else None
+                # Cancellation is stored separately by the manager. It must not
+                # write the worker-owned function_call record, which includes
+                # gpt_slot_held; a stale overwrite could leak a semaphore slot.
+                cancel = shared.get(f"cancel::{brd_path.name}")
+                if (isinstance(cancel, dict) and cancel.get("pid") == os.getpid()
+                        and cancel.get("invocation_id") == state.get("invocation_id")):
+                    return cancel.get("reason") or "Function execution budget exceeded"
+                return None
             if event == "slot_acquired":
                 state["gpt_slot_held"] = True
                 shared[key] = state
