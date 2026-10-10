@@ -1,0 +1,24 @@
+name: Temporary timeout configuration and logging checks
+on:
+  push:
+    branches: [unified-watchdog-timeouts-and-exit-logging]
+jobs:
+  regression:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - name: Syntax validation
+        run: python -m py_compile job_manager.py source/brd_processor.py tests/test_config_and_exit_logging.py
+      - name: Shared limits and exit logging
+        run: python tests/test_config_and_exit_logging.py
+      - name: Existing watchdog safety regression
+        run: python tests/test_watchdog_fail_closed.py
+      - name: Fair scheduling regression
+        run: python tests/test_scheduler_fairness.py
