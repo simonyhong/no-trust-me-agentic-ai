@@ -339,7 +339,7 @@ class JobManager:
         if reason == "blocked_configuration":
             self._session_blocks.add(brd.name)
         elif reason in {"service_retry", "state_retry"}:
-            # A failed done-state write needs a bounded retry even if files did not change.
+            # Retry failed storage even without a further BRD/jobs-file change.
             self._retry_after[brd.name] = time.monotonic() + 45.0
         elif reason == "quantum":
             # Yield behind queued BRDs rather than immediately monopolizing a slot.
@@ -1162,7 +1162,7 @@ def main():
         brd = PROJECT_ROOT / "documents" / sys.argv[2]
         approval = brd_processor.approve_handcrafted_recovery(brd, SAVED_FUNC_DIR, REGISTRY)
         print(f"Approved handcrafted retry: {brd.name} -> {approval['script']}")
-        print("Restart JobManager. The block clears only after the human-approved handcrafted source loads unchanged; no behavior tests run.")
+        print("Restart JobManager. The block clears ONLY if the handcrafted code passes all BRD and N-job tests.")
         return
     if len(sys.argv) > 1:
         raise SystemExit("Usage: python job_manager.py [--approve-handcrafted BRD_example.txt]")
